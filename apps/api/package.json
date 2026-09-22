@@ -1,0 +1,1 @@
+{"name":"@ered-luin/api","version":"0.1.0","private":true,"type":"module","scripts":{"build":"tsc -p tsconfig.json","typecheck":"tsc -p tsconfig.json --noEmit","start":"node dist/server.js"},"dependencies":{"@ered-luin/contracts":"workspace:*","fastify":"^5.4.0"}}
