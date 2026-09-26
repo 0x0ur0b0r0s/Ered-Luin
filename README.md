@@ -54,3 +54,5 @@ Follow the [D1 local paper demo](docs/d1-local-demo.md). It runs the API and das
 - The complete API suite has had one intermittent timeout in a synthetic Alchemy configuration test; that test passed when rerun alone with a longer timeout. See the build-state for the exact recorded result.
 - The ledger uses Node's built-in SQLite API, which Node currently labels a release candidate.
 - This repository does not establish that synthetic results reflect market behavior or qualify for any external program.
+
+D2l research sampling and the local monitor are documented in [docs/d2l-research-monitoring.md](docs/d2l-research-monitoring.md).

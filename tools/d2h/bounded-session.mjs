@@ -53,7 +53,7 @@ export function validateRunManifest(value) {
   const v2 = record(value) && value.schemaVersion === 2;
   const keys = v2 ? [...baseKeys, 'profile', 'research'] : baseKeys;
   if (!exactKeys(value, keys) || (value.schemaVersion !== 1 && value.schemaVersion !== 2) ||
-      (v2 && (value.profile !== 'weth-research-v1' || !validateResearch(value.research))) || (!v2 && value.schemaVersion !== 1) || typeof value.runId !== 'string' || !/^[0-9a-f-]{36}$/iu.test(value.runId) ||
+      (v2 && (!['weth-research-v1', 'weth-research-v2'].includes(value.profile) || !validateResearch(value.research))) || (!v2 && value.schemaVersion !== 1) || typeof value.runId !== 'string' || !/^[0-9a-f-]{36}$/iu.test(value.runId) ||
       typeof value.stateIdentity !== 'string' || !/^[0-9a-f]{64}$/u.test(value.stateIdentity) || !validIso(value.createdAt) || !validIso(value.updatedAt) ||
       !validIso(value.deadlineAt) || !safeInt(value.maxAttempts, 1) || !safeInt(value.creditCap, 1) || !safeInt(value.successTarget, 1) || !safeInt(value.reconciledPriorSuccesses) ||
       !safeInt(value.baselineAllocatedCredits) || !STATUSES.has(value.status) || !safeInt(value.pid, 1) ||
@@ -118,13 +118,14 @@ export function makeSafeLedger(snapshot) {
   });
 }
 export function makeNewRunManifest({ bounds, stateIdentity, runId = randomUUID(), baselineAllocatedCredits, ledger, profile = 'default-v1' }) {
-  if (profile !== 'default-v1' && profile !== 'weth-research-v1') throw new Error('MANIFEST_INVALID');
+  const researchProfile = profile === 'weth-research-v1' || profile === 'weth-research-v2';
+  if (profile !== 'default-v1' && !researchProfile) throw new Error('MANIFEST_INVALID');
   const now = new Date().toISOString();
-  const research = profile === 'weth-research-v1' ? {
+  const research = researchProfile ? {
     successfulHttpRequests: { TOKEN_SCREENER: 0, SMART_MONEY_NETFLOW: 0 }, usableResearchSnapshots: 0, cacheHits: 0, failedResults: 0, organizerConfirmedSuccesses: null,
   } : null;
   return validateRunManifest({
-    schemaVersion: profile === 'weth-research-v1' ? 2 : 1, ...(research ? { profile, research } : {}), runId, stateIdentity, createdAt: now, updatedAt: now, deadlineAt: bounds.deadlineAt,
+    schemaVersion: research ? 2 : 1, ...(research ? { profile, research } : {}), runId, stateIdentity, createdAt: now, updatedAt: now, deadlineAt: bounds.deadlineAt,
     maxAttempts: bounds.maxAttempts, creditCap: bounds.creditCap, successTarget: bounds.successTarget, reconciledPriorSuccesses: bounds.reconciledPriorSuccesses,
     baselineAllocatedCredits, status: 'RUNNING', pid: process.pid, stopReason: null, reconciliationConfirmedAt: null,
     stats: { cycles: 0, providerAttempts: 0, qualifyingSuccesses: 0, cacheHits: 0, actualChargedCredits: 0, unknownChargeAttempts: 0, failedQueries: 0, lastEndpoint: null, lastObservedAt: null },

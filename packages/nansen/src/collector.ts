@@ -12,11 +12,17 @@ const TASKS: readonly { readonly intervalMs: number; readonly query: NansenManag
   { intervalMs: COLLECTION_INTERVAL_MS.SMART_MONEY_NETFLOW, query: Object.freeze({ operation: 'SMART_MONEY_NETFLOW', asset: 'BASE_PAIR', timeframe: '1h', pageBound: 1, retryBound: 0, perPage: 100 }) },
 ]);
 export const NANSEN_COLLECTOR_PLAN = Object.freeze(TASKS.map((task) => Object.freeze({ intervalMs: task.intervalMs, query: task.query })));
+export const WETH_RESEARCH_CADENCE_V1_MS = 5 * 60 * 1_000;
+export const WETH_RESEARCH_CADENCE_V2_MS = 3 * 60 * 1_000;
 export const WETH_RESEARCH_PLAN = Object.freeze([
-  Object.freeze({ intervalMs: 5 * 60 * 1_000, query: WETH_RESEARCH_QUERIES.TOKEN_SCREENER }),
-  Object.freeze({ intervalMs: 5 * 60 * 1_000, query: WETH_RESEARCH_QUERIES.SMART_MONEY_NETFLOW }),
+  Object.freeze({ intervalMs: WETH_RESEARCH_CADENCE_V1_MS, query: WETH_RESEARCH_QUERIES.TOKEN_SCREENER }),
+  Object.freeze({ intervalMs: WETH_RESEARCH_CADENCE_V1_MS, query: WETH_RESEARCH_QUERIES.SMART_MONEY_NETFLOW }),
 ]);
-export type NansenCollectorProfile = 'default-v1' | 'weth-research-v1';
+export const WETH_RESEARCH_PLAN_V2 = Object.freeze([
+  Object.freeze({ intervalMs: WETH_RESEARCH_CADENCE_V2_MS, query: WETH_RESEARCH_QUERIES.TOKEN_SCREENER }),
+  Object.freeze({ intervalMs: WETH_RESEARCH_CADENCE_V2_MS, query: WETH_RESEARCH_QUERIES.SMART_MONEY_NETFLOW }),
+]);
+export type NansenCollectorProfile = 'default-v1' | 'weth-research-v1' | 'weth-research-v2';
 type TimerHandle = ReturnType<typeof setTimeout>;
 type TimerFunction = (callback: () => void, delayMs: number) => TimerHandle;
 
@@ -62,7 +68,7 @@ export class NansenCollectorScheduler {
   private readonly clock: () => Date;
   private readonly setTimer: TimerFunction;
   private readonly clearTimer: (handle: TimerHandle) => void;
-  private readonly plan: typeof NANSEN_COLLECTOR_PLAN | typeof WETH_RESEARCH_PLAN;
+  private readonly plan: readonly { readonly intervalMs: number; readonly query: NansenManagedQuery }[];
   private readonly nextDue = new Map<NansenManagedQuery['operation'], number>();
   private active = false;
   private running = false;
@@ -82,9 +88,10 @@ export class NansenCollectorScheduler {
         (options.onQuery !== undefined && typeof options.onQuery !== 'function') ||
         (options.onQueryError !== undefined && typeof options.onQueryError !== 'function') ||
         (options.stopOnFailure !== undefined && typeof options.stopOnFailure !== 'boolean') ||
-        (options.profile !== undefined && options.profile !== 'default-v1' && options.profile !== 'weth-research-v1') ||
+        (options.profile !== undefined && options.profile !== 'default-v1' && options.profile !== 'weth-research-v1' && options.profile !== 'weth-research-v2') ||
         (options.onCycle !== undefined && typeof options.onCycle !== 'function')) throw new TypeError('Invalid collector options.');
-    this.plan = options.profile === 'weth-research-v1' ? WETH_RESEARCH_PLAN : NANSEN_COLLECTOR_PLAN;
+    this.plan = options.profile === 'weth-research-v1' ? WETH_RESEARCH_PLAN
+      : options.profile === 'weth-research-v2' ? WETH_RESEARCH_PLAN_V2 : NANSEN_COLLECTOR_PLAN;
     this.enabled = options.enabled ?? false;
     this.clock = options.clock ?? (() => new Date());
     this.setTimer = options.setTimer ?? ((callback, delay) => setTimeout(callback, delay));

@@ -24,7 +24,7 @@ export function hasUsableWethResearchSignal(query, result) {
 
 /** D2l accounting extends the accepted D2h guards without changing its attempt, credit, deadline, or reconciliation controls. */
 export function createD2lResearchHooks(options) {
-  if (!record(options?.manifest?.research) || options.manifest.profile !== 'weth-research-v1' || typeof options.persist !== 'function') throw new Error('SESSION_INVALID');
+  if (!record(options?.manifest?.research) || !['weth-research-v1', 'weth-research-v2'].includes(options.manifest.profile) || typeof options.persist !== 'function') throw new Error('SESSION_INVALID');
   let deferBasePersist = false;
   const base = createD2hRunHooks({ ...options, persist: (manifest) => { if (!deferBasePersist) options.persist(manifest); } });
   return Object.freeze({

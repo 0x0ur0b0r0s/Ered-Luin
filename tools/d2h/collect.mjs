@@ -2,7 +2,7 @@ import { closeSync, lstatSync, openSync, readFileSync, unlinkSync, writeFileSync
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  NANSEN_COLLECTOR_PLAN, WETH_RESEARCH_PLAN, NANSEN_COST_PROFILE_VERSION, NANSEN_OPERATION_COSTS,
+  NANSEN_COLLECTOR_PLAN, WETH_RESEARCH_PLAN, WETH_RESEARCH_PLAN_V2, NANSEN_COST_PROFILE_VERSION, NANSEN_OPERATION_COSTS,
   createNansenClient, createNansenCollector, createNansenQueryManager,
   openCreditLedger, openNansenObservationStore,
 } from '../../packages/nansen/dist/index.js';
@@ -32,7 +32,7 @@ const SAFE_ERRORS = new Set([
   'RUN_BOUNDS_INVALID', 'RUN_CREDIT_CAP_EXCEEDS_ACTIVE_BUDGET', 'ACTIVE_BUDGET_INVALID',
   'COLLECTION_UNRELATED_GATE_ENABLED', 'COLLECTION_COST_PROFILE_MISMATCH', 'NANSEN_CREDENTIAL_UNAVAILABLE',
   'LEDGER_RECONCILIATION_REQUIRED', 'LEDGER_REMAINING_BELOW_CREDIT_CAP', 'RESUME_NOT_ALLOWED',
-  'RESUME_REQUIRES_RECONCILIATION', 'RESUME_COUNTERS_REQUIRED', 'RESUME_COUNTERS_INVALID',
+  'RESUME_REQUIRES_RECONCILIATION', 'RESUME_COUNTERS_REQUIRED', 'RESUME_COUNTERS_INVALID', 'RESUME_PROFILE_UPGRADE_REQUIRED', 'RESUME_SUCCESS_TARGET_INVALID',
   'RUN_DEADLINE_EXPIRED', 'RUN_ALREADY_ACTIVE', 'STOP_REQUEST_INVALID', 'STOP_REQUEST_UNAVAILABLE',
   'STATUS_COMMAND_INVALID', 'SUMMARY_CONFIG_REQUIRED', 'D2H_FAILED_SAFE', 'SUMMARY_INPUT_INVALID', 'SUMMARY_CLOCK_INVALID',
 ]);
@@ -48,23 +48,28 @@ function safeErrorCode(error) {
 function parseArgs(argv) {
   const commands = new Set(['preview', 'start', 'status', 'stop', 'resume', 'summary']);
   let command = 'preview'; let commandSeen = false;
-  const values = {}; const booleans = new Set(['--reconciled']);
+  const values = {}; const booleans = new Set(['--reconciled', '--upgrade-research-profile']);
   for (let i = 0; i < argv.length; i += 1) {
     const key = argv[i];
     if (commands.has(key)) { if (commandSeen) throw new Error('USAGE'); command = key; commandSeen = true; continue; }
-    if (booleans.has(key)) { if (values.reconciled) throw new Error('USAGE'); values.reconciled = true; continue; }
+    if (booleans.has(key)) {
+      const name = key.slice(2).replace(/-([a-z])/gu, (_, letter) => letter.toUpperCase());
+      if (values[name]) throw new Error('USAGE');
+      values[name] = true;
+      continue;
+    }
     if (!key.startsWith('--') || !argv[i + 1] || argv[i + 1].startsWith('--')) throw new Error('USAGE');
     const name = key.slice(2).replace(/-([a-z])/gu, (_, letter) => letter.toUpperCase());
     if (Object.hasOwn(values, name)) throw new Error('USAGE');
     values[name] = argv[++i];
   }
-  if (values.profile !== undefined && !['default-v1', 'weth-research-v1'].includes(values.profile)) throw new Error('USAGE');
+  if (values.profile !== undefined && !['default-v1', 'weth-research-v1', 'weth-research-v2'].includes(values.profile)) throw new Error('USAGE');
   const profile = values.profile ?? 'default-v1';
   const allowedByCommand = {
     preview: new Set(['profile', 'durationMinutes', 'deadline', 'maxAttempts', 'creditCap', 'successTarget', 'reconciledPriorSuccesses']),
     start: new Set(['profile', 'config', 'manifest', 'durationMinutes', 'deadline', 'maxAttempts', 'creditCap', 'successTarget', 'reconciledPriorSuccesses']),
     status: new Set(['profile', 'manifest']), stop: new Set(['profile', 'manifest']), summary: new Set(['profile', 'config']),
-    resume: new Set(['profile', 'config', 'manifest', 'reconciled', 'reconciledAttempts', 'reconciledSuccesses', 'reconciledCredits', 'reconciledUnknownCharges']),
+    resume: new Set(['profile', 'config', 'manifest', 'reconciled', 'reconciledAttempts', 'reconciledSuccesses', 'reconciledCredits', 'reconciledUnknownCharges', 'upgradeResearchProfile', 'successTarget']),
   };
   if (Object.keys(values).some((key) => !allowedByCommand[command].has(key))) throw new Error('USAGE');
   return { command, ...values, profile };
@@ -83,7 +88,8 @@ function parseDeadline(value) {
   if (!Number.isSafeInteger(timestamp)) throw new Error('RUN_BOUNDS_INVALID');
   return new Date(timestamp).toISOString();
 }
-function planFor(profile) { return profile === 'weth-research-v1' ? WETH_RESEARCH_PLAN : NANSEN_COLLECTOR_PLAN; }
+function isResearchProfile(profile) { return profile === 'weth-research-v1' || profile === 'weth-research-v2'; }
+function planFor(profile) { return profile === 'weth-research-v1' ? WETH_RESEARCH_PLAN : profile === 'weth-research-v2' ? WETH_RESEARCH_PLAN_V2 : NANSEN_COLLECTOR_PLAN; }
 function makeBounds(options) {
   const durationMinutes = options.durationMinutes === undefined ? null : positiveInt(options.durationMinutes);
   const deadlineAt = options.deadline === undefined ? null : parseDeadline(options.deadline);
@@ -146,6 +152,20 @@ function removeStopRequest(path, runId) {
   const marker = markerPath(path);
   if (readStopRequest(marker, runId) === 'REQUESTED') { try { unlinkSync(marker); } catch { /* A leftover marker is harmless and will fail closed on the next run. */ } }
 }
+export function prepareResumeProfile(existing, options) {
+  const currentProfile = existing.profile ?? 'default-v1';
+  const requestedUpgrade = options.upgradeResearchProfile === true;
+  const eligibleUpgrade = currentProfile === 'weth-research-v1' && options.profile === 'weth-research-v2';
+  if (requestedUpgrade !== eligibleUpgrade) throw new Error(requestedUpgrade ? 'RESUME_NOT_ALLOWED' : 'RESUME_PROFILE_UPGRADE_REQUIRED');
+  if (!eligibleUpgrade) {
+    if (currentProfile !== options.profile || options.successTarget !== undefined) throw new Error('RESUME_NOT_ALLOWED');
+    return existing;
+  }
+  if (options.successTarget === undefined) throw new Error('RESUME_SUCCESS_TARGET_INVALID');
+  const successTarget = positiveInt(options.successTarget, 'RESUME_SUCCESS_TARGET_INVALID');
+  if (successTarget < existing.successTarget || successTarget > existing.maxAttempts) throw new Error('RESUME_SUCCESS_TARGET_INVALID');
+  return { ...existing, profile: 'weth-research-v2', successTarget };
+}
 function safeLedgerEqual(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
 function updateFromReconciliation(manifest, options) {
   const ledgerChanged = !safeLedgerEqual(manifest.ledger, makeSafeLedger(manifest._currentLedger));
@@ -183,7 +203,7 @@ function setManifestStatus(manifest, scheduler, ledger) {
 async function summary(options) {
   const environment = readD2cExternalConfig(requireConfigPath(options.config));
   const store = openNansenObservationStore({ databasePath: environment.NANSEN_OBSERVATION_STORE_PATH, storeId: environment.NANSEN_OBSERVATION_STORE_ID });
-  try { printJson(options.profile === 'weth-research-v1' ? summarizeWethResearchHistory(store) : summarizeNansenHistory(store)); }
+  try { printJson(isResearchProfile(options.profile) ? summarizeWethResearchHistory(store) : summarizeNansenHistory(store)); }
   finally { store.close(); }
 }
 async function startOrResume(command, options) {
@@ -196,9 +216,9 @@ async function startOrResume(command, options) {
   else {
     if (options.reconciled !== true) throw new Error('RESUME_REQUIRES_RECONCILIATION');
     existing = readRunManifest(manifestPath, ROOT);
-    if ((existing.profile ?? 'default-v1') !== options.profile) throw new Error('RESUME_NOT_ALLOWED');
+    existing = prepareResumeProfile(existing, options);
     if (existing.status === 'COMPLETED') throw new Error('RESUME_NOT_ALLOWED');
-    if (collectionProcessIsAlive(existing.pid)) throw new Error('RUN_ALREADY_ACTIVE');
+    if (existing.status === 'RUNNING' && collectionProcessIsAlive(existing.pid)) throw new Error('RUN_ALREADY_ACTIVE');
     if (Date.parse(existing.deadlineAt) <= Date.now()) throw new Error('RUN_DEADLINE_EXPIRED');
   }
   const creditCap = command === 'start' ? positiveInt(options.creditCap) : existing.creditCap;
@@ -252,10 +272,10 @@ async function startOrResume(command, options) {
     const persist = () => writeRunManifest(manifestPath, ROOT, manifest);
     const hookOptions = { bounds: resolvedBounds, manifest, getLedgerSnapshot: () => ledger.getSnapshot(),
       costs: NANSEN_OPERATION_COSTS, persist, stopRequested: () => readStopRequest(markerPath(manifestPath), manifest.runId) !== 'NONE' };
-    const hooks = options.profile === 'weth-research-v1' ? createD2lResearchHooks(hookOptions) : createD2hRunHooks(hookOptions);
+    const hooks = isResearchProfile(options.profile) ? createD2lResearchHooks(hookOptions) : createD2hRunHooks(hookOptions);
     const client = createNansenClient({ ledger, enabled: true, apiKey, maxPages: 1, timeoutMs: 8_000, maxResponseBytes: 1_048_576 });
     const manager = createNansenQueryManager({ client, store, enabled: true, maxPageBound: 1, maxRetryBound: 0, beforeDispatch: hooks.beforeDispatch,
-      ...(options.profile === 'weth-research-v1' ? { cachePolicy: 'weth-research-v1' } : {}) });
+      ...(isResearchProfile(options.profile) ? { cachePolicy: options.profile } : {}) });
     scheduler = createNansenCollector({ manager, profile: options.profile, enabled: true, stopOnFailure: true, beforeQuery: hooks.beforeQuery, onQuery: hooks.onQuery, onQueryError: hooks.onQueryError,
       onCycle: () => { hooks.onCycle(); printJson({ event: 'cycle', ...publicRunStatus(manifest, true) }); } });
     process.on('SIGINT', onSignal); process.on('SIGTERM', onSignal);

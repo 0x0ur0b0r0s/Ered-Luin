@@ -43,6 +43,7 @@ coverage/
 !/docs/implementation-plan.md
 !/docs/build-state.md
 !/docs/current-handoff.md
+!/docs/d2l-research-monitoring.md
 !/docs/d1-local-demo.md
 !/docs/friday-demo.md
 !/docs/typesafe-development.md

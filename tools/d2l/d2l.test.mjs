@@ -4,7 +4,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  NANSEN_COLLECTOR_PLAN, WETH_RESEARCH_PLAN, WETH_RESEARCH_CACHE_KEYS, QUERY_CACHE_TTL_MS,
+  NANSEN_COLLECTOR_PLAN, WETH_RESEARCH_PLAN, WETH_RESEARCH_PLAN_V2, WETH_RESEARCH_V2_MAX_CACHE_AGE_MS, WETH_RESEARCH_CACHE_KEYS, QUERY_CACHE_TTL_MS,
   NANSEN_COST_PROFILE_VERSION, NANSEN_OPERATION_COSTS, createNansenClient, createNansenCollector,
   createNansenQueryManager, initializeCreditLedger, initializeNansenObservationStore, openNansenObservationStore,
 } from '../../packages/nansen/dist/index.js';
@@ -99,13 +99,19 @@ describe('D2l bounded WETH research profile', () => {
     await expect(runtime.manager({ cachePolicy: 'weth-research-v1' }).query({ ...query, perPage: 99 })).rejects.toMatchObject({ code: 'INVALID_REQUEST' });
   });
 
-  it('persists versioned research counters outside the repository and reads them after restart', () => {
-    const runtime = makeRuntime(); const manifest = manifestFor(runtime);
-    manifest.research.usableResearchSnapshots = 7; manifest.research.successfulHttpRequests.TOKEN_SCREENER = 5;
-    const path = join(runtime.directory, 'd2l-run.json');
-    writeRunManifest(path, PROJECT_ROOT, manifest, { createOnly: true });
-    const restored = readRunManifest(path, PROJECT_ROOT);
-    expect(restored).toMatchObject({ schemaVersion: 2, profile: 'weth-research-v1', research: { usableResearchSnapshots: 7, successfulHttpRequests: { TOKEN_SCREENER: 5, SMART_MONEY_NETFLOW: 0 }, organizerConfirmedSuccesses: null } });
+  it('persists both research profile versions and existing counters across restart', () => {
+    const runtime = makeRuntime();
+    for (const profile of ['weth-research-v1', 'weth-research-v2']) {
+      const manifest = makeNewRunManifest({ bounds: { deadlineAt: new Date(time.value + 48 * 60 * 60_000).toISOString(), maxAttempts: 900,
+        creditCap: 2_700, successTarget: 850, reconciledPriorSuccesses: 0 }, profile, stateIdentity: 'b'.repeat(64),
+        baselineAllocatedCredits: runtime.ledger.getSnapshot().allocatedCredits, ledger: runtime.ledger.getSnapshot() });
+      manifest.research.usableResearchSnapshots = 7; manifest.research.successfulHttpRequests.TOKEN_SCREENER = 5;
+      const path = join(runtime.directory, `${profile}-run.json`);
+      writeRunManifest(path, PROJECT_ROOT, manifest, { createOnly: true });
+      const restored = readRunManifest(path, PROJECT_ROOT);
+      expect(restored).toMatchObject({ schemaVersion: 2, profile, research: { usableResearchSnapshots: 7,
+        successfulHttpRequests: { TOKEN_SCREENER: 5, SMART_MONEY_NETFLOW: 0 }, organizerConfirmedSuccesses: null } });
+    }
   });
 
   it('keeps the default three-task plan and selects only the immutable two-task research plan', async () => {
@@ -120,6 +126,33 @@ describe('D2l bounded WETH research profile', () => {
     await scheduler.start(); scheduler.stop();
     expect(seen.map((query) => query.operation)).toEqual(['TOKEN_SCREENER', 'SMART_MONEY_NETFLOW']);
     expect(timers[0].delayMs).toBe(300_000);
+
+    const v2Timers = [];
+    const v2Scheduler = createNansenCollector({ manager: { async query(query) { seen.push(query); return {}; } }, profile: 'weth-research-v2', enabled: true,
+      setTimer(callback, delayMs) { const timer = { callback, delayMs }; v2Timers.push(timer); return timer; }, clearTimer() {} });
+    await v2Scheduler.start(); v2Scheduler.stop();
+    expect(seen.slice(-2).map((query) => query.operation)).toEqual(['TOKEN_SCREENER', 'SMART_MONEY_NETFLOW']);
+    expect(v2Timers[0].delayMs).toBe(180_000);
+    expect(WETH_RESEARCH_PLAN_V2.map(({ intervalMs }) => intervalMs)).toEqual([180_000, 180_000]);
+  });
+
+  it('uses an exact three-minute cache age for both v2 research requests across manager restarts', async () => {
+    const runtime = makeRuntime();
+    expect(WETH_RESEARCH_V2_MAX_CACHE_AGE_MS).toBe(180_000);
+    for (const { query } of WETH_RESEARCH_PLAN_V2) {
+      const before = requests.length;
+      const first = await runtime.manager({ cachePolicy: 'weth-research-v2' }).query(query);
+      expect(first.status).toBe('fresh'); expect(requests).toHaveLength(before + 1);
+      runtime.reopenStore();
+      time.value += 180_000;
+      const boundary = await runtime.manager({ cachePolicy: 'weth-research-v2' }).query(query);
+      expect(boundary).toMatchObject({ status: 'cached', cacheHit: true, qualifyingSuccessfulRequests: 0 });
+      expect(requests).toHaveLength(before + 1);
+      time.value += 1;
+      const aged = await runtime.manager({ cachePolicy: 'weth-research-v2' }).query(query);
+      expect(aged.status).toBe('fresh'); expect(requests).toHaveLength(before + 2);
+    }
+    expect(runtime.ledger.getSnapshot().allocatedCredits).toBe(12);
   });
 
   it('continues for complete WETH when USDC is absent, counts the usable snapshot, and leaves G2 blocked on USDC', async () => {

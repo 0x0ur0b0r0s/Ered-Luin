@@ -33,6 +33,7 @@ const MAX_PER_PAGE = 100;
 const MAX_IN_FLIGHT_QUERIES = 8;
 const NEGATIVE_CACHE_TTL_MS = 15_000;
 export const WETH_RESEARCH_MAX_CACHE_AGE_MS = 5 * 60 * 1_000;
+export const WETH_RESEARCH_V2_MAX_CACHE_AGE_MS = 3 * 60 * 1_000;
 
 export type NansenManagedQuery =
   | { readonly operation: 'TOKEN_SCREENER'; readonly asset: 'BASE_PAIR'; readonly timeframe: '1h'; readonly pageBound: number; readonly retryBound: number; readonly perPage: number }
@@ -93,8 +94,8 @@ export interface NansenQueryManagerOptions {
   readonly beforeDispatch?: (query: NansenManagedQuery) => string | null;
   /** Opt-in transient diagnostics; sink failures never affect policy results or stored observations. */
   readonly onDiagnostic?: (diagnostic: ManagedQueryDiagnostic) => void;
-  /** Fixed, opt-in five-minute cache-age policy for the immutable WETH research queries only. */
-  readonly cachePolicy?: 'weth-research-v1';
+  /** Fixed, opt-in cache-age policy matched to an immutable WETH research profile. */
+  readonly cachePolicy?: 'weth-research-v1' | 'weth-research-v2';
 }
 interface ManagerConfig {
   readonly client: NansenClient; readonly store: NansenObservationStore; readonly enabled: boolean;
@@ -102,7 +103,7 @@ interface ManagerConfig {
   readonly clock: () => Date;
   readonly beforeDispatch?: ((query: NansenManagedQuery) => string | null) | undefined;
   readonly onDiagnostic?: ((diagnostic: ManagedQueryDiagnostic) => void) | undefined;
-  readonly cachePolicy?: 'weth-research-v1' | undefined;
+  readonly cachePolicy?: 'weth-research-v1' | 'weth-research-v2' | undefined;
 }
 type QueryData = readonly (TokenScreenerToken | FlowIntelligenceRow | SmartMoneyNetflowToken)[];
 interface AttemptResult { readonly data: QueryData; readonly completeness: AdapterCompleteness; readonly failure: AdapterFailure | null; readonly refs: readonly PageReference[]; readonly unavailable: readonly string[]; readonly diagnostics: AdapterEvidenceDiagnostics | null; }
@@ -135,12 +136,12 @@ function validateConfig(value: unknown): ManagerConfig {
       typeof maxRetryBound !== 'number' || !Number.isSafeInteger(maxRetryBound) || maxRetryBound < 0 || maxRetryBound > MAX_QUERY_RETRY_BOUND || typeof clock !== 'function' ||
       (beforeDispatch !== undefined && typeof beforeDispatch !== 'function') ||
       (onDiagnostic !== undefined && typeof onDiagnostic !== 'function') ||
-      (cachePolicy !== undefined && cachePolicy !== 'weth-research-v1') ||
+      (cachePolicy !== undefined && cachePolicy !== 'weth-research-v1' && cachePolicy !== 'weth-research-v2') ||
       (cachePolicy !== undefined && source !== 'nansen') ||
       (cachePolicy !== undefined && typeof store?.getMostRecentWithObservations !== 'function')) {
     throw new NansenClientError('INVALID_CONFIGURATION');
   }
-  return { client, store, enabled, source, maxPageBound, maxRetryBound, clock: clock as () => Date, beforeDispatch: beforeDispatch as ((query: NansenManagedQuery) => string | null) | undefined, onDiagnostic: onDiagnostic as ((diagnostic: ManagedQueryDiagnostic) => void) | undefined, cachePolicy: cachePolicy as 'weth-research-v1' | undefined };
+  return { client, store, enabled, source, maxPageBound, maxRetryBound, clock: clock as () => Date, beforeDispatch: beforeDispatch as ((query: NansenManagedQuery) => string | null) | undefined, onDiagnostic: onDiagnostic as ((diagnostic: ManagedQueryDiagnostic) => void) | undefined, cachePolicy: cachePolicy as 'weth-research-v1' | 'weth-research-v2' | undefined };
 }
 function validateQuery(value: unknown, config: ManagerConfig): NansenManagedQuery {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new NansenClientError('INVALID_REQUEST');
@@ -295,17 +296,18 @@ export class NansenQueryManager {
 
   async query(input: NansenManagedQuery): Promise<ManagedQueryResult> {
     const query = validateQuery(input, this.config);
-    if (this.config.cachePolicy === 'weth-research-v1' && !isWethResearchQuery(query)) throw new NansenClientError('INVALID_REQUEST');
+    if (this.config.cachePolicy !== undefined && !isWethResearchQuery(query)) throw new NansenClientError('INVALID_REQUEST');
     const cacheKey = digest(canonicalQuery(query, this.config.source));
     const nowMs = now(this.config.clock);
     if (!this.config.enabled) return this.noCallResult(query, cacheKey, { code: 'DISABLED', status: null, ledgerCode: null }, 'disabled');
     let cached: ObservationSnapshot | null;
-    if (this.config.cachePolicy === 'weth-research-v1') {
+    if (this.config.cachePolicy !== undefined) {
       const recent = this.config.store.getMostRecentWithObservations(cacheKey);
       const acquiredAtMs = recent ? Date.parse(recent.acquiredAt) : Number.NaN;
       const ageMs = nowMs - acquiredAtMs;
+      const maxCacheAgeMs = this.config.cachePolicy === 'weth-research-v2' ? WETH_RESEARCH_V2_MAX_CACHE_AGE_MS : WETH_RESEARCH_MAX_CACHE_AGE_MS;
       cached = recent && recent.source === this.config.source && recent.completeness === 'complete' && recent.failure === null &&
-        Number.isSafeInteger(acquiredAtMs) && ageMs >= 0 && ageMs <= WETH_RESEARCH_MAX_CACHE_AGE_MS ? recent : null;
+        Number.isSafeInteger(acquiredAtMs) && ageMs >= 0 && ageMs <= maxCacheAgeMs ? recent : null;
     } else cached = this.config.store.getFreshCache(cacheKey, new Date(nowMs));
     if (cached) return this.fromSnapshot(cached, 'cached', true, false);
     const pending = this.inFlight.get(cacheKey);

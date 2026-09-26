@@ -33,6 +33,11 @@ The D1 resize-clock repair had focused API regressions pass 10/10 and dashboard 
 
 These are recorded results from the prior gate work. They were not rerun as part of this documentation and GitHub preparation.
 
+## Current bounded D2l research status
+
+The user-authorized external research run is active under an opt-in three-minute `weth-research-v2` profile with a matching 180-second cache-age limit. It uses the existing canonical WETH Token Screener and Smart Money Netflow queries, one page, zero retries, an 850-success run target, 900-attempt ceiling, 2,700-credit ceiling, and fixed `2026-09-27T21:00:00Z` stop. Its protected ledger and manifest remain outside the repository. This does not change checked-in zero-paid-call defaults or paper-only execution controls.
+
+Offline validation for the v2 profile/monitor passed: D2l 16/16, D2h 11/11, typecheck, lint, and workspace build. A resume regression also covers recycled PIDs on failed manifests. The operational run status is held in protected local state; this summary is not a live feed. Three-minute cadence is research sampling only and does not establish trading readiness or organizer qualification.
 ## Pending work
 
 - Obtain independent review of the D1 resize-clock repair and complete the manual visual dashboard pass.

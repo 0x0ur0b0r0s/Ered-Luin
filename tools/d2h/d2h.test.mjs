@@ -14,6 +14,7 @@ import {
   buildD2hPreview, createD2hRunHooks, createStateIdentity, makeNewRunManifest, publicRunStatus,
   readRunManifest, writeRunManifest,
 } from './bounded-session.mjs';
+import { prepareResumeProfile } from './collect.mjs';
 import { summarizeNansenHistory } from './history-summary.mjs';
 import { acquireCollectionLock } from '../d2c/collector-lock.mjs';
 
@@ -116,6 +117,19 @@ afterEach(() => {
 });
 
 describe('D2h bounded collection preparation', () => {
+  it('upgrades an interrupted D2l run only through the explicit v2 profile transition', () => {
+    const existing = { profile: 'weth-research-v1', successTarget: 700, maxAttempts: 900,
+      stats: { providerAttempts: 91, qualifyingSuccesses: 90, actualChargedCredits: 270 } };
+    const upgraded = prepareResumeProfile(existing, { profile: 'weth-research-v2', upgradeResearchProfile: true, successTarget: '850' });
+    expect(upgraded).toMatchObject({ profile: 'weth-research-v2', successTarget: 850, maxAttempts: 900,
+      stats: { providerAttempts: 91, qualifyingSuccesses: 90, actualChargedCredits: 270 } });
+    expect(existing).toMatchObject({ profile: 'weth-research-v1', successTarget: 700 });
+    expect(() => prepareResumeProfile(existing, { profile: 'weth-research-v2', successTarget: '850' })).toThrow('RESUME_PROFILE_UPGRADE_REQUIRED');
+    expect(() => prepareResumeProfile(existing, { profile: 'weth-research-v2', upgradeResearchProfile: true, successTarget: '699' })).toThrow('RESUME_SUCCESS_TARGET_INVALID');
+    expect(() => prepareResumeProfile(existing, { profile: 'weth-research-v2', upgradeResearchProfile: true, successTarget: '901' })).toThrow('RESUME_SUCCESS_TARGET_INVALID');
+    expect(() => prepareResumeProfile(existing, { profile: 'default-v1', upgradeResearchProfile: true, successTarget: '850' })).toThrow('RESUME_NOT_ALLOWED');
+  });
+
   it('previews the natural cadence with no side effects and no implicit spend caps', () => {
     const preview = buildD2hPreview({ plan: NANSEN_COLLECTOR_PLAN, costs: NANSEN_OPERATION_COSTS, now: new Date(time.value) });
     expect(preview).toMatchObject({ mode: 'DRY_RUN', providerCalls: 0, credentialRead: false, persistentWrite: false, timerScheduled: false,
@@ -246,7 +260,9 @@ describe('D2h bounded collection preparation', () => {
       observationStorePath, observationStoreId });
     const manifest = makeNewRunManifest({ bounds: runBounds, stateIdentity, baselineAllocatedCredits: 0, ledger: ledger.getSnapshot() });
     manifest.status = 'FAILED';
-    manifest.pid = 2_147_483_647;
+    // A failed manifest may retain a PID that has since been reused by an unrelated live process.
+    // The shared observation-store lock, not that stale PID, governs whether a resume can proceed.
+    manifest.pid = process.pid;
     manifest.stopReason = 'UNKNOWN_CHARGE_REQUIRES_RECONCILIATION';
     manifest.stats.providerAttempts = 1;
     manifest.stats.unknownChargeAttempts = 1;

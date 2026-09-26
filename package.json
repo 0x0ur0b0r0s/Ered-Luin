@@ -28,6 +28,8 @@
     "test:d2k": "vitest run tools/d2k",
     "d2c:init-observation-store": "node tools/d2c/init-observation-store.mjs",
     "d2l:collect": "node tools/d2h/collect.mjs --profile weth-research-v1",
+    "d2l:collect:v2": "node tools/d2h/collect.mjs --profile weth-research-v2",
+    "d2l:monitor": "node tools/d2l/monitor.mjs",
     "test:d2l": "pnpm run build && vitest run tools/d2l"
   },
   "devDependencies": {
