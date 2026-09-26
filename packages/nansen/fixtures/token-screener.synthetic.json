@@ -1,0 +1,41 @@
+{
+  "data": [
+    {
+      "chain": "base",
+      "token_address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      "token_symbol": "USDC",
+      "token_age_days": 450,
+      "token_deployment_date": "2023-09-01T00:00:00Z",
+      "market_cap_usd": 25000000000,
+      "liquidity": 12000000,
+      "price_usd": 1,
+      "price_change": 0,
+      "fdv": 25000000000,
+      "buy_volume": 125000,
+      "sell_volume": 117000,
+      "volume": 242000,
+      "netflow": 8000
+    },
+    {
+      "chain": "base",
+      "token_address": "0x4200000000000000000000000000000000000006",
+      "token_symbol": "WETH",
+      "token_age_days": 700,
+      "token_deployment_date": "2021-08-01T00:00:00Z",
+      "market_cap_usd": 420000000,
+      "liquidity": 22000000,
+      "price_usd": 3200,
+      "price_change": 2.5,
+      "fdv": 420000000,
+      "buy_volume": 100000,
+      "sell_volume": 90000,
+      "volume": 190000,
+      "netflow": 10000
+    }
+  ],
+  "pagination": {
+    "page": 1,
+    "per_page": 100,
+    "is_last_page": true
+  }
+}

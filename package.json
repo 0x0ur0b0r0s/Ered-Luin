@@ -4,15 +4,31 @@
   "private": true,
   "packageManager": "pnpm@11.25.0",
   "engines": {
-    "node": ">=22.0.0",
+    "node": ">=24.20.0 <25",
     "pnpm": ">=11.0.0"
   },
   "scripts": {
     "build": "pnpm -r --if-present build",
     "typecheck": "pnpm -r --if-present typecheck",
     "lint": "eslint . --max-warnings=0",
-    "test": "pnpm test:contracts",
-    "test:contracts": "vitest run packages/contracts/src"
+    "test": "pnpm test:contracts && pnpm test:nansen && pnpm test:api && pnpm test:dashboard && pnpm test:typesafe && pnpm test:d2c && pnpm test:d2h && pnpm test:d2k && pnpm test:d2l",
+    "test:contracts": "vitest run packages/contracts/src",
+    "test:nansen": "pnpm --filter @ered-luin/nansen test",
+    "test:api": "pnpm --filter @ered-luin/api test",
+    "test:dashboard": "pnpm --filter @ered-luin/dashboard test",
+    "test:typesafe": "vitest run tools/typesafe/shadow.test.mjs",
+    "d2c:preflight": "node tools/d2c/preflight.mjs",
+    "d2c:collect": "node tools/d2c/manual-collect.mjs",
+    "d2h:collect": "node tools/d2h/collect.mjs",
+    "d2k:collect": "node tools/d2k/run-token-diagnostic.mjs",
+    "d2c:offline-smoke": "node tools/d2c/offline-start-smoke.mjs",
+    "d2c:base-capability-probe": "node tools/d2c/base-capability-probe.mjs",
+    "test:d2c": "vitest run tools/d2c",
+    "test:d2h": "pnpm run build && vitest run tools/d2h",
+    "test:d2k": "vitest run tools/d2k",
+    "d2c:init-observation-store": "node tools/d2c/init-observation-store.mjs",
+    "d2l:collect": "node tools/d2h/collect.mjs --profile weth-research-v1",
+    "test:d2l": "pnpm run build && vitest run tools/d2l"
   },
   "devDependencies": {
     "@eslint/js": "^9.30.0",
@@ -21,6 +37,6 @@
     "typescript": "^5.8.3",
     "typescript-eslint": "^8.35.0",
     "vitest": "^3.2.4",
-    "@types/node": "^22.0.0"
+    "@types/node": "^24.0.0"
   }
 }

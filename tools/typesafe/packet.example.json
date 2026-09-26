@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "role": "Astra",
+  "phase": "preflight",
+  "task": "Synthetic documentation example",
+  "scope": "Clarify documentation wording only; no runtime changes.",
+  "requirements": [
+    "Explain that reported reserved credits are estimates."
+  ],
+  "evidence": [
+    "Synthetic proposed text: allocations estimate costs and do not prove provider charges."
+  ],
+  "claim": "The proposed wording addresses the requested clarification.",
+  "sourceRevision": "synthetic-example-v1",
+  "hardReviewRequired": false,
+  "publicSafeReviewed": true
+}

@@ -1,0 +1,35 @@
+{
+  "data": [
+    {
+      "token_address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+      "token_symbol": "USDC",
+      "net_flow_1h_usd": 500,
+      "net_flow_24h_usd": 9000,
+      "net_flow_7d_usd": -12000,
+      "net_flow_30d_usd": 34000,
+      "chain": "base",
+      "token_sectors": ["Stablecoin"],
+      "trader_count": 12,
+      "token_age_days": 450,
+      "market_cap_usd": 25000000000
+    },
+    {
+      "token_address": "0x4200000000000000000000000000000000000006",
+      "token_symbol": "WETH",
+      "net_flow_1h_usd": 23000,
+      "net_flow_24h_usd": 150000,
+      "net_flow_7d_usd": -200000,
+      "net_flow_30d_usd": 450000,
+      "chain": "base",
+      "token_sectors": ["DeFi"],
+      "trader_count": 37,
+      "token_age_days": 700,
+      "market_cap_usd": 420000000
+    }
+  ],
+  "pagination": {
+    "page": 1,
+    "per_page": 100,
+    "is_last_page": true
+  }
+}

@@ -5,5 +5,5 @@ export default tseslint.config(
   { ignores: ['**/dist/**', '**/node_modules/**', '**/coverage/**'] },
   eslint.configs.recommended,
   ...tseslint.configs.recommended,
-  { files: ['**/*.{ts,tsx}'], languageOptions: { globals: { ...globals.browser, ...globals.node } } },
+  { files: ['**/*.{js,mjs,ts,tsx}'], languageOptions: { globals: { ...globals.browser, ...globals.node } } },
 );

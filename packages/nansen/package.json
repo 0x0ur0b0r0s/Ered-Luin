@@ -1,0 +1,25 @@
+{
+  "name": "@ered-luin/nansen",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.20.0 <25"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "pnpm --filter @ered-luin/contracts build && pnpm run build && vitest run src"
+  },
+  "devDependencies": {
+    "@ered-luin/contracts": "workspace:*"
+  }
+}

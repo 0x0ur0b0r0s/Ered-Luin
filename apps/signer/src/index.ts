@@ -1,2 +1,4 @@
-/** G0 isolation marker. No wallet key, signing routine, or broadcast path exists yet. */
-export const signerStatus = { implementation: 'not_started', liveSigningEnabled: false } as const;
+import { createHash } from 'node:crypto';
+
+export const signerStatus = { implementation: 'g3b-isolated-worker', liveSigningEnabled: false, broadcastEnabled: false } as const;
+export function signedBytesDigest(bytes: Buffer): string { return createHash('sha256').update(bytes).digest('hex'); }

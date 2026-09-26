@@ -1,40 +1,48 @@
 # Build state
 
-## Gate status
+Last updated: 2026-09-26
 
-- **G0 — Foundation:** implementation and acceptance checks are complete; awaiting user review.
+This is the public, repository-safe status summary. Detailed operator prompts, provider ledgers, credentials, run manifests, and private run reports are kept outside the public release.
 
-## Current workspace
+## Accepted implementation
 
-- Root: D:/Nansen COMP Project
-- Repository: https://github.com/0x0ur0b0r0s/Ered-Luin; new, independent Git history on main.
-- Existing Nansen source or historical data: none was present in the destination.
-- Paid Nansen requests: disabled; default credit budget is 0.
-- Execution: paper mode; live execution and signing are disabled.
-- Validation runtime: Node.js v24.20.0 and pnpm v11.25.0.
+- G0 foundation and shared synthetic contracts.
+- G1 credit accounting, provider normalization, and offline analysis gates.
+- G2 deterministic policy and paper workflow.
+- G3 bounded lifecycle, transaction, signer-boundary, and recovery work for offline scope.
+- D1 local paper dashboard work.
+- D2 offline/local implementation through the accepted D2l collector repairs.
 
-## G0 validation evidence
+Acceptance of offline code does not accept production deployment, live provider readiness, signer custody, or live trading.
 
-- `pnpm install --offline --frozen-lockfile` — passed.
-- `pnpm run build` — passed for the API, signal worker, dashboard, signer shell, and contracts package.
-- `pnpm run typecheck` — passed for all five workspace packages.
-- `pnpm run lint` — passed.
-- `pnpm run test:contracts` — passed; 13 tests.
+## Latest recorded validation
 
-The contract tests cover strict unknown-field rejection, exact-input amount strings, unsupported assets and chains, intent expiry, complete/zero/missing signals, shared decision/execution/audit shapes, and disabled spending/live defaults.
+For the accepted D2l integration in the launch checkout:
 
-## Rename validation — 2026-09-22
+- Workspace build passed; only the existing nonfatal Vite/Zod annotation notices were reported.
+- The affected D2l/D2c/D2h/D2k suite passed, 48/48 tests.
 
-- Ered Luin name, @ered-luin package scope, workspace imports, lockfile, dashboard, and API service label updated.
-- Frozen-lockfile install, build, type checks, lint, and all 13 contract tests passed after the rename.
-- pnpm fetched missing registry metadata for its supply-chain check; locked dependency versions were preserved.
+The commands recorded for that integration were:
 
-## Project identity
+    & .\tools\pnpm-node24.ps1 run build
+    & .\tools\pnpm-node24.ps1 exec vitest run tools/d2l tools/d2c tools/d2h tools/d2k --reporter=dot
 
-- Product: Ered Luin; workspace package scope: @ered-luin.
-- This repository starts from the local G0 foundation and contains no Cirdan scanner history.
-- Nansen available balance: 40,000 credits, user-reported; initial 2,000-credit collection ceiling remains proposed and paid calls remain disabled.
+Typecheck and lint were not rerun for that integration because the integrated source matched the accepted repair source. The preceding workspace checks had passed.
 
-## Next task
+The D1 resize-clock repair had focused API regressions pass 10/10 and dashboard tests pass 12/12. Its latest full API suite result was 149/150: one synthetic Alchemy configuration test hit the default five-second timeout and passed when rerun alone with a longer timeout. Treat that timeout as an unresolved CI reliability issue, not as a full-suite pass.
 
-Prepare the G1 prompt after user review of G0. G1 adds provider adapters and persistent per-attempt budget accounting. Keep collection disabled until a key and explicit spending ceiling are supplied.
+These are recorded results from the prior gate work. They were not rerun as part of this documentation and GitHub preparation.
+
+## Pending work
+
+- Obtain independent review of the D1 resize-clock repair and complete the manual visual dashboard pass.
+- Complete the remaining D2 production-readiness review, including provider behavior, deployment configuration, signer custody, and operational recovery.
+- Reconcile the external operator run state before resuming any interrupted bounded research collection. Its protected manifest and ledger are not part of this repository.
+- Do not claim organizer-confirmed qualification from local HTTP success or synthetic test evidence.
+
+## Limitations
+
+- The checked-in templates keep paid provider calls off, but a separately provisioned operator configuration can enable a bounded research run.
+- No claim of live trading readiness, profitability, market validity, or organizer qualification is made.
+- Synthetic fixtures and mocks are for software validation only.
+- Node's built-in SQLite API is currently marked as a release candidate by Node.js.

@@ -1,1 +1,23 @@
-{"name":"@ered-luin/api","version":"0.1.0","private":true,"type":"module","scripts":{"build":"tsc -p tsconfig.json","typecheck":"tsc -p tsconfig.json --noEmit","start":"node dist/server.js"},"dependencies":{"@ered-luin/contracts":"workspace:*","fastify":"^5.4.0"}}
+{
+  "name": "@ered-luin/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/server.js",
+    "init-paper-store": "node dist/paper-store-cli.js",
+    "execution-store": "node dist/execution-store-cli.js",
+    "test": "pnpm --filter @ered-luin/contracts build && pnpm --filter @ered-luin/signer build && pnpm --filter @ered-luin/api build && vitest run src",
+    "init-d2-audit-store": "node dist/d2-audit-cli.js"
+  },
+  "dependencies": {
+    "@ered-luin/contracts": "workspace:*",
+    "@ered-luin/nansen": "workspace:*",
+    "@noble/curves": "1.9.1",
+    "fastify": "^5.4.0",
+    "viem": "2.56.7",
+    "zod": "^4.0.0"
+  }
+}

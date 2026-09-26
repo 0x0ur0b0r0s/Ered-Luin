@@ -1,0 +1,25 @@
+{
+  "data": [
+    {
+      "public_figure_net_flow_usd": 0,
+      "public_figure_avg_flow_usd": null,
+      "public_figure_wallet_count": 0,
+      "top_pnl_net_flow_usd": 2100,
+      "top_pnl_avg_flow_usd": 700,
+      "top_pnl_wallet_count": 3,
+      "whale_net_flow_usd": -450,
+      "whale_avg_flow_usd": 225,
+      "whale_wallet_count": 2,
+      "smart_trader_net_flow_usd": 12000,
+      "smart_trader_avg_flow_usd": 3000,
+      "smart_trader_wallet_count": 4,
+      "exchange_net_flow_usd": -1000,
+      "exchange_avg_flow_usd": 500,
+      "exchange_wallet_count": 0,
+      "fresh_wallets_net_flow_usd": null,
+      "fresh_wallets_avg_flow_usd": null,
+      "fresh_wallets_wallet_count": null
+    }
+  ],
+  "warnings": []
+}
