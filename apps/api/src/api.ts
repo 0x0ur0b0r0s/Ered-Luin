@@ -11,8 +11,11 @@ import {
   d2OperatorSessionSchema, d2PrepareSignRequestSchema, d2SubmitRequestSchema,
 } from '@ered-luin/contracts';
 import type { D2ExecutionService } from './d2-execution.js';
+import type { D2BrowserExecutionService } from './d2-browser-execution.js';
 import type { LocalOperatorAuthenticator, OperatorRequestContext, OperatorPrincipal } from './operator-auth.js';
-import { d2AnalysisInvokeRequestSchema, d2AnalysisInvokeSchema, d2AnalysisPreviewRequestSchema, d2AnalysisPreviewSchema } from '@ered-luin/contracts';
+import { d2AnalysisInvokeRequestSchema, d2AnalysisInvokeSchema, d2AnalysisPreviewRequestSchema, d2AnalysisPreviewSchema,
+  d2BrowserExecutionActionResponseSchema, d2BrowserAllowancePreflightResponseSchema, d2BrowserExecutionHashRequestSchema, d2BrowserExecutionIdentityRequestSchema,
+  d2BrowserExecutionPrepareRequestSchema, d2BrowserExecutionRejectRequestSchema } from '@ered-luin/contracts';
 import type { D2FreshAnalysisService } from './d2-fresh-analysis.js';
 
 export interface G2DataProvider {
@@ -28,6 +31,7 @@ export interface CreateApiOptions {
   readonly d2Production?: D2ProductionService;
   readonly d2FreshAnalysis?: D2FreshAnalysisService;
   readonly d2Execution?: D2ExecutionService;
+  readonly d2BrowserExecution?: D2BrowserExecutionService;
   readonly operatorAuth?: LocalOperatorAuthenticator;
   readonly d2Runtime?: () => D2Runtime;
   readonly clock?: () => Date;
@@ -215,7 +219,7 @@ export function createApiApp(options: CreateApiOptions): FastifyInstance {
       service: 'ered-luin-api', status: options.d2Production ? 'ok' : 'degraded',
       appMode: 'PRODUCTION_READ_ONLY', paidNansenCallsEnabled: false, activeNansenCreditBudget: 0, liveExecutionEnabled: false,
       executionControls: { operatorAuthConfigured: options.operatorAuth?.configured ?? false,
-        signingEnabled: options.d2Execution?.signingEnabled ?? false, submissionEnabled: options.d2Execution?.submissionEnabled ?? false, reviewedMode: false },
+        signingEnabled: options.d2Execution?.signingEnabled ?? false, submissionEnabled: options.d2Execution?.submissionEnabled ?? false, reviewedMode: false, browserWalletEnabled: options.d2BrowserExecution?.enabled ?? false },
       nansenObservationStore: options.d2Production ? 'configured' : 'unconfigured',
       productionEvaluation: options.d2Production ? 'configured' : 'unconfigured', baseRpc: 'disabled',
       g3cStatusReader: options.g3cStatusReader ? 'configured' : 'unconfigured', rpcRunBudget: null,
@@ -391,6 +395,118 @@ export function createApiApp(options: CreateApiOptions): FastifyInstance {
       if (['D2_POLICY_NOT_EXECUTABLE', 'D2_EXECUTION_NOT_RESERVED', 'D2_SESSION_IDENTITY_MISMATCH', 'D2_EXECUTION_NOT_SIMULATABLE'].includes(code)) return reply.code(409).send({ error: code });
       return reply.code(503).send({ error: 'D2_SIMULATION_UNAVAILABLE' });
     }
+  });
+  app.post('/v1/production/browser-executions/allowance', async (request, reply) => {
+    if (!authorizeOperator(options, request, reply, 'mutation')) return;
+    const parsed = d2BrowserExecutionPrepareRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'INVALID_D2_BROWSER_ALLOWANCE_REQUEST' });
+    if (!options.d2BrowserExecution) return reply.code(503).send({ error: 'D2_BROWSER_EXECUTION_UNAVAILABLE' });
+    try {
+      const result = d2BrowserAllowancePreflightResponseSchema.parse(await options.d2BrowserExecution.checkAllowance(parsed.data));
+      return reply.code(200).send(result);
+    } catch (error) {
+      const code = d2bErrorCode(error, 'D2_BROWSER_EXECUTION_UNAVAILABLE');
+      return reply.code(d2bErrorStatus(code)).send({ error: code.startsWith('D2_') || code.startsWith('G3C_') ? code : 'D2_BROWSER_EXECUTION_UNAVAILABLE' });
+    }
+  });  app.post('/v1/production/browser-executions/prepare', async (request, reply) => {
+    if (!authorizeOperator(options, request, reply, 'mutation')) return;
+    const parsed = d2BrowserExecutionPrepareRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'INVALID_D2_BROWSER_PREPARE_REQUEST' });
+    if (!options.d2BrowserExecution) return reply.code(503).send({ error: 'D2_BROWSER_EXECUTION_UNAVAILABLE' });
+    try {
+      const result = d2BrowserExecutionActionResponseSchema.parse(options.d2BrowserExecution.prepare(parsed.data));
+      return reply.code(result.replayed ? 200 : 201).send(result);
+    } catch (error) {
+      const code = d2bErrorCode(error, 'D2_BROWSER_EXECUTION_UNAVAILABLE');
+      return reply.code(d2bErrorStatus(code)).send({ error: code.startsWith('D2_') || code.startsWith('G3C_') ? code : 'D2_BROWSER_EXECUTION_UNAVAILABLE' });
+    }
+  });
+  app.post('/v1/production/browser-executions/approval/prepare', async (request, reply) => {
+    if (!authorizeOperator(options, request, reply, 'mutation')) return;
+    const parsed = d2BrowserExecutionPrepareRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'INVALID_D2_BROWSER_APPROVAL_REQUEST' });
+    if (!options.d2BrowserExecution) return reply.code(503).send({ error: 'D2_BROWSER_EXECUTION_UNAVAILABLE' });
+    try {
+      const result = d2BrowserExecutionActionResponseSchema.parse(await options.d2BrowserExecution.prepareApproval(parsed.data));
+      return reply.code(result.replayed ? 200 : 201).send(result);
+    } catch (error) {
+      const code = d2bErrorCode(error, 'D2_BROWSER_EXECUTION_UNAVAILABLE');
+      return reply.code(d2bErrorStatus(code)).send({ error: code.startsWith('D2_') || code.startsWith('G3C_') ? code : 'D2_BROWSER_EXECUTION_UNAVAILABLE' });
+    }
+  });
+  app.post('/v1/production/browser-executions/approval/complete', async (request, reply) => {
+    if (!authorizeOperator(options, request, reply, 'mutation')) return;
+    const parsed = d2BrowserExecutionPrepareRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'INVALID_D2_BROWSER_APPROVAL_REQUEST' });
+    if (!options.d2BrowserExecution) return reply.code(503).send({ error: 'D2_BROWSER_EXECUTION_UNAVAILABLE' });
+    try {
+      const result = d2BrowserExecutionActionResponseSchema.parse(await options.d2BrowserExecution.completeApproval(
+        parsed.data.proposalId, parsed.data.operationId, parsed.data.sessionId));
+      return reply.code(200).send(result);
+    } catch (error) {
+      const code = d2bErrorCode(error, 'D2_BROWSER_EXECUTION_UNAVAILABLE');
+      return reply.code(d2bErrorStatus(code)).send({ error: code.startsWith('D2_') || code.startsWith('G3C_') ? code : 'D2_BROWSER_EXECUTION_UNAVAILABLE' });
+    }
+  });  app.post('/v1/production/browser-executions/begin', async (request, reply) => {
+    if (!authorizeOperator(options, request, reply, 'mutation')) return;
+    const parsed = d2BrowserExecutionPrepareRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'INVALID_D2_BROWSER_BEGIN_REQUEST' });
+    if (!options.d2BrowserExecution) return reply.code(503).send({ error: 'D2_BROWSER_EXECUTION_UNAVAILABLE' });
+    try {
+      const result = d2BrowserExecutionActionResponseSchema.parse(await options.d2BrowserExecution.begin(parsed.data));
+      return reply.code(200).send(result);
+    } catch (error) {
+      const code = d2bErrorCode(error, 'D2_BROWSER_EXECUTION_UNAVAILABLE');
+      return reply.code(d2bErrorStatus(code)).send({ error: code.startsWith('D2_') || code.startsWith('G3C_') ? code : 'D2_BROWSER_EXECUTION_UNAVAILABLE' });
+    }
+  });
+  app.post('/v1/production/browser-executions/hash', async (request, reply) => {
+    if (!authorizeOperator(options, request, reply, 'mutation')) return;
+    const parsed = d2BrowserExecutionHashRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'INVALID_D2_BROWSER_HASH_REQUEST' });
+    if (!options.d2BrowserExecution) return reply.code(503).send({ error: 'D2_BROWSER_EXECUTION_UNAVAILABLE' });
+    try {
+      const result = d2BrowserExecutionActionResponseSchema.parse(await options.d2BrowserExecution.attachHash(
+        parsed.data.proposalId, parsed.data.operationId, parsed.data.transactionHash));
+      return reply.code(200).send(result);
+    } catch (error) {
+      const code = d2bErrorCode(error, 'D2_BROWSER_EXECUTION_UNAVAILABLE');
+      return reply.code(d2bErrorStatus(code)).send({ error: code.startsWith('D2_') || code.startsWith('G3C_') ? code : 'D2_BROWSER_EXECUTION_UNAVAILABLE' });
+    }
+  });
+  app.post('/v1/production/browser-executions/reconcile', async (request, reply) => {
+    if (!authorizeOperator(options, request, reply, 'mutation')) return;
+    const parsed = d2BrowserExecutionIdentityRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'INVALID_D2_BROWSER_RECONCILE_REQUEST' });
+    if (!options.d2BrowserExecution) return reply.code(503).send({ error: 'D2_BROWSER_EXECUTION_UNAVAILABLE' });
+    try {
+      const result = d2BrowserExecutionActionResponseSchema.parse(await options.d2BrowserExecution.reconcile(parsed.data.proposalId, parsed.data.operationId));
+      return reply.code(200).send(result);
+    } catch (error) {
+      const code = d2bErrorCode(error, 'D2_BROWSER_EXECUTION_UNAVAILABLE');
+      return reply.code(d2bErrorStatus(code)).send({ error: code.startsWith('D2_') || code.startsWith('G3C_') ? code : 'D2_BROWSER_EXECUTION_UNAVAILABLE' });
+    }
+  });
+  app.post('/v1/production/browser-executions/reject', async (request, reply) => {
+    if (!authorizeOperator(options, request, reply, 'mutation')) return;
+    const parsed = d2BrowserExecutionRejectRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.code(400).send({ error: 'INVALID_D2_BROWSER_REJECTION_REQUEST' });
+    if (!options.d2BrowserExecution) return reply.code(503).send({ error: 'D2_BROWSER_EXECUTION_UNAVAILABLE' });
+    try {
+      const result = d2BrowserExecutionActionResponseSchema.parse(options.d2BrowserExecution.reject(parsed.data.proposalId, parsed.data.operationId, parsed.data.reason));
+      return reply.code(200).send(result);
+    } catch (error) {
+      const code = d2bErrorCode(error, 'D2_BROWSER_EXECUTION_UNAVAILABLE');
+      return reply.code(d2bErrorStatus(code)).send({ error: code.startsWith('D2_') || code.startsWith('G3C_') ? code : 'D2_BROWSER_EXECUTION_UNAVAILABLE' });
+    }
+  });
+  app.get<{ Params: { proposalId: string; operationId: string } }>('/v1/production/browser-executions/:proposalId/:operationId', async (request, reply) => {
+    if (!authorizeOperator(options, request, reply, 'read')) return;
+    const parsed = d2BrowserExecutionIdentityRequestSchema.safeParse(request.params);
+    if (!parsed.success) return reply.code(400).send({ error: 'INVALID_D2_BROWSER_IDENTITY' });
+    if (!options.d2BrowserExecution) return reply.code(503).send({ error: 'D2_BROWSER_EXECUTION_UNAVAILABLE' });
+    try { return d2BrowserExecutionActionResponseSchema.parse(options.d2BrowserExecution.status(parsed.data.proposalId, parsed.data.operationId)); }
+    catch { return reply.code(404).send({ error: 'D2_BROWSER_WORKFLOW_NOT_FOUND' }); }
   });
   app.post('/v1/production/executions/prepare-sign', async (request, reply) => {
     const operator = authorizeOperator(options, request, reply, 'mutation');

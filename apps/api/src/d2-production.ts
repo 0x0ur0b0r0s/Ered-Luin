@@ -6,7 +6,7 @@ import {
 import { G2_LIMITS, evaluateG2Intent, type G2Evaluation, type PaperAccountSnapshot } from './policy.js';
 import { evaluateWithResizeQuotes, parseQuoteBundle, type G2DataProvider } from './api.js';
 import { D2AuditStore } from './d2-audit-store.js';
-import type { ObservationSnapshot } from '@ered-luin/nansen';
+import { BASE_USDC_PRICE_CACHE_KEY, BASE_USDC_OHLCV_PRICE_CACHE_KEY, WETH_RESEARCH_CACHE_KEYS, type ObservationSnapshot } from '@ered-luin/nansen';
 import type { ExecutionTransactionEnvelope } from '@ered-luin/contracts';
 import type { G2QuoteBundle } from './policy.js';
 import type { ExecutionStore } from './execution-store.js';
@@ -18,6 +18,7 @@ import type { G1DShadowAuditStore } from '@ered-luin/nansen';
 
 export interface D2ObservationReader {
   getLatestSnapshots(source: 'nansen' | 'synthetic'): readonly ObservationSnapshot[];
+  getLatestSnapshotByCacheKey?(cacheKey: string): ObservationSnapshot | null;
 }
 export interface D2PolicyProvider extends G2DataProvider {
   getAccountSnapshot(intent: D2Proposal['intent'], sessionId?: string): Promise<PaperAccountSnapshot | null> | PaperAccountSnapshot | null;
@@ -47,30 +48,108 @@ function checkedNow(clock: () => Date): Date {
 function isG2Evidence(signal: NormalizedSignal): boolean {
   return (signal.endpoint === 'TOKEN_SCREENER' &&
       ((signal.asset === 'USDC' || signal.asset === 'WETH') && signal.metric === 'price_usd')) ||
+    (signal.endpoint === 'TOKEN_OHLCV' && signal.asset === 'USDC' && signal.metric === 'price_usd') ||
     (signal.endpoint === 'SMART_MONEY_NETFLOW' && signal.asset === 'WETH' && signal.metric === 'net_flow_1h_usd');
 }
 function batchFromSnapshot(snapshot: ObservationSnapshot, now: Date): D2ObservationBatch {
   const fetchedMs = Date.parse(snapshot.fetchedAt);
   const acquiredMs = Date.parse(snapshot.acquiredAt);
   const expiresMs = Date.parse(snapshot.expiresAt);
-  const ageMs = Math.max(0, now.getTime() - fetchedMs);
+  const candleSignal = snapshot.operation === 'TOKEN_OHLCV' && snapshot.signals.length === 1 ? snapshot.signals[0]! : null;
+  const eventMs = candleSignal ? Date.parse(candleSignal.observedAt) : fetchedMs;
+  const ageValue = now.getTime() - eventMs;
+  const ageMs = Number.isSafeInteger(ageValue) ? Math.max(0, ageValue) : 0;
   const freshnessBound = snapshot.operation === 'SMART_MONEY_NETFLOW' ? 35 * 60_000 : 10 * 60_000;
-  const timeValid = Number.isSafeInteger(fetchedMs) && Number.isSafeInteger(acquiredMs) && fetchedMs <= now.getTime() &&
-    acquiredMs <= now.getTime() && expiresMs > now.getTime() && now.getTime() - fetchedMs <= freshnessBound;
+  const intervalValid = snapshot.operation !== 'TOKEN_OHLCV' ||
+    (snapshot.timeframe === '1m' && candleSignal?.timeframe === '1m' &&
+      Date.parse(candleSignal.observedAt) + 60_000 <= fetchedMs);
+  const timeValid = Number.isSafeInteger(fetchedMs) && Number.isSafeInteger(acquiredMs) && Number.isSafeInteger(eventMs) &&
+    fetchedMs <= now.getTime() && acquiredMs <= now.getTime() && eventMs <= now.getTime() &&
+    expiresMs > now.getTime() && now.getTime() - eventMs <= freshnessBound && intervalValid;
   const status = snapshot.failure ? 'failed' : snapshot.completeness !== 'complete' ? 'incomplete' : timeValid ? 'fresh' : 'stale';
   return {
-    snapshotId: snapshot.snapshotId, operation: snapshot.operation, source: 'nansen', status,
+    snapshotId: snapshot.snapshotId, operation: snapshot.operation, timeframe: snapshot.timeframe, source: 'nansen', status,
     completeness: snapshot.completeness, fetchedAt: snapshot.fetchedAt, acquiredAt: snapshot.acquiredAt, expiresAt: snapshot.expiresAt,
     ageMs, pageBound: snapshot.pageBound, retryBound: snapshot.retryBound, pageReferences: [...snapshot.pageReferences],
     observationIds: snapshot.signals.filter(isG2Evidence).map((signal) => signal.signalId), unavailableFields: [...snapshot.unavailableFields],
   };
+}
+function latestD2EvidenceSnapshots(reader: D2ObservationReader, now: Date): readonly ObservationSnapshot[] {
+  const latest = reader.getLatestSnapshots('nansen');
+  if (!reader.getLatestSnapshotByCacheKey) return latest;
+  const pairCandidate = reader.getLatestSnapshotByCacheKey(WETH_RESEARCH_CACHE_KEYS.TOKEN_SCREENER);
+  const usdcCandidate = reader.getLatestSnapshotByCacheKey(BASE_USDC_PRICE_CACHE_KEY);
+  const ohlcvCandidate = reader.getLatestSnapshotByCacheKey(BASE_USDC_OHLCV_PRICE_CACHE_KEY);
+  const netflow = latest.filter((snapshot) => snapshot.operation === 'SMART_MONEY_NETFLOW').slice(0, 1);
+  const isPriceSnapshot = (snapshot: ObservationSnapshot | null, cacheKey: string, asset: 'BASE_PAIR' | 'USDC') =>
+    snapshot !== null && snapshot.source === 'nansen' && snapshot.cacheKey === cacheKey &&
+    snapshot.operation === 'TOKEN_SCREENER' && snapshot.asset === asset && snapshot.timeframe === '1h';
+  const isOhlcvSnapshot = (snapshot: ObservationSnapshot | null) =>
+    snapshot !== null && snapshot.source === 'nansen' && snapshot.cacheKey === BASE_USDC_OHLCV_PRICE_CACHE_KEY &&
+    snapshot.operation === 'TOKEN_OHLCV' && snapshot.asset === 'USDC' && snapshot.timeframe === '1m' &&
+    snapshot.pageBound === 1 && snapshot.retryBound === 0;
+  const solePriceSignal = (snapshot: ObservationSnapshot, asset: 'USDC' | 'WETH'): NormalizedSignal | null => {
+    const matches = snapshot.signals.filter((signal) =>
+      signal.endpoint === 'TOKEN_SCREENER' && signal.asset === asset && signal.metric === 'price_usd');
+    if (matches.length !== 1) return null;
+    const signal = matches[0];
+    if (!signal || signal.provider !== 'nansen' || signal.chainId !== 8453 || signal.unit !== 'usd_micros' ||
+        signal.observedAt !== snapshot.acquiredAt || signal.fetchedAt !== snapshot.fetchedAt) return null;
+    return signal;
+  };
+  const soleOhlcvSignal = (snapshot: ObservationSnapshot): NormalizedSignal | null => {
+    const matches = snapshot.signals.filter((signal) =>
+      signal.endpoint === 'TOKEN_OHLCV' && signal.asset === 'USDC' && signal.metric === 'price_usd');
+    if (snapshot.signals.length !== 1 || matches.length !== 1) return null;
+    const signal = matches[0];
+    if (!signal || signal.provider !== 'nansen' || signal.chainId !== 8453 || signal.unit !== 'usd_micros' ||
+        signal.timeframe !== '1m' || signal.fetchedAt !== snapshot.fetchedAt ||
+        !Number.isSafeInteger(Date.parse(signal.observedAt)) || Date.parse(signal.observedAt) + 60_000 > Date.parse(signal.fetchedAt)) return null;
+    return signal;
+  };
+  const isFreshUsdcPrice = (snapshot: ObservationSnapshot, signal: NormalizedSignal) =>
+    batchFromSnapshot(snapshot, now).status === 'fresh' && signal.quality === 'COMPLETE' &&
+    signal.value !== null && /^[0-9]+$/u.test(signal.value) && BigInt(signal.value) > 0n;
+
+  const pair = isPriceSnapshot(pairCandidate, WETH_RESEARCH_CACHE_KEYS.TOKEN_SCREENER, 'BASE_PAIR') ? pairCandidate : null;
+  const usdc = isPriceSnapshot(usdcCandidate, BASE_USDC_PRICE_CACHE_KEY, 'USDC') ? usdcCandidate : null;
+  const ohlcv = isOhlcvSnapshot(ohlcvCandidate) ? ohlcvCandidate : null;
+  const pairWeth = pair ? solePriceSignal(pair, 'WETH') : null;
+  const pairUsdc = pair ? solePriceSignal(pair, 'USDC') : null;
+  const separateUsdc = usdc ? solePriceSignal(usdc, 'USDC') : null;
+  const candleUsdc = ohlcv ? soleOhlcvSignal(ohlcv) : null;
+
+  // Prefer a fresh completed OHLCV candle, then the accepted standalone screener fallback, then the paired source.
+  // Stale or malformed preferred-source data cannot shadow a fresh valid fallback.
+  const selectedUsdc = candleUsdc && isFreshUsdcPrice(ohlcv!, candleUsdc)
+    ? { snapshot: ohlcv!, signal: candleUsdc, paired: false }
+    : separateUsdc && isFreshUsdcPrice(usdc!, separateUsdc)
+      ? { snapshot: usdc!, signal: separateUsdc, paired: false }
+      : pairUsdc && isFreshUsdcPrice(pair!, pairUsdc)
+        ? { snapshot: pair!, signal: pairUsdc, paired: true }
+        : candleUsdc
+          ? { snapshot: ohlcv!, signal: candleUsdc, paired: false }
+          : separateUsdc
+            ? { snapshot: usdc!, signal: separateUsdc, paired: false }
+            : pairUsdc
+              ? { snapshot: pair!, signal: pairUsdc, paired: true }
+              : null;
+
+  const pairEvidence = pair && (pairWeth || selectedUsdc?.paired)
+    ? { ...pair, signals: [...(pairWeth ? [pairWeth] : []), ...(selectedUsdc?.paired ? [selectedUsdc.signal] : [])] }
+    : null;
+  const usdcEvidence = selectedUsdc && !selectedUsdc.paired
+    ? { ...selectedUsdc.snapshot, signals: [selectedUsdc.signal] }
+    : null;
+  return Object.freeze([pairEvidence, usdcEvidence, ...netflow]
+    .filter((snapshot): snapshot is ObservationSnapshot => snapshot !== null));
 }
 function evidenceFrom(snapshots: readonly ObservationSnapshot[], now: Date): D2EvidenceResponse {
   const nansenSnapshots = snapshots.filter((snapshot) => snapshot.source === 'nansen').slice(0, 3);
   const batches = nansenSnapshots.map((snapshot) => batchFromSnapshot(snapshot, now));
   const observations = nansenSnapshots.flatMap((snapshot) => snapshot.signals.filter(isG2Evidence));
   const required = [
-    observations.find((signal) => signal.endpoint === 'TOKEN_SCREENER' && signal.asset === 'USDC' && signal.metric === 'price_usd'),
+    observations.find((signal) => (signal.endpoint === 'TOKEN_OHLCV' || signal.endpoint === 'TOKEN_SCREENER') && signal.asset === 'USDC' && signal.metric === 'price_usd'),
     observations.find((signal) => signal.endpoint === 'TOKEN_SCREENER' && signal.asset === 'WETH' && signal.metric === 'price_usd'),
     observations.find((signal) => signal.endpoint === 'SMART_MONEY_NETFLOW' && signal.asset === 'WETH' && signal.metric === 'net_flow_1h_usd'),
   ];
@@ -130,7 +209,7 @@ export function createD2ProductionService(input: {
   readonly clock?: () => Date;
 }): D2ProductionService {
   const clock = input.clock ?? (() => new Date());
-  const getEvidence = () => evidenceFrom(input.observations.getLatestSnapshots('nansen'), checkedNow(clock));
+  const getEvidence = () => { const now = checkedNow(clock); return evidenceFrom(latestD2EvidenceSnapshots(input.observations, now), now); };
   return Object.freeze({
     evidence: getEvidence,
     createProposal(raw: unknown) {
@@ -140,7 +219,7 @@ export function createD2ProductionService(input: {
       }
       const now = checkedNow(clock);
       const proposalId = randomUUID();
-      const snapshots = input.observations.getLatestSnapshots('nansen');
+      const snapshots = latestD2EvidenceSnapshots(input.observations, now);
       const evidence = evidenceFrom(snapshots, now);
       const semanticHandoff = input.g1dAnalysisHandoffEnabled === true
         ? semanticUnavailable('NO_MATCHING_JUDGMENT')
@@ -175,7 +254,7 @@ export function createD2ProductionService(input: {
             semanticHandoff: semanticUnavailable(reason) } });
         if (association.evidenceHash !== proposalEvidenceHash(persisted)) return unavailable('NO_MATCHING_JUDGMENT');
         const now = checkedNow(clock);
-        const snapshots = input.observations.getLatestSnapshots('nansen');
+        const snapshots = latestD2EvidenceSnapshots(input.observations, now);
         const currentEvidence = evidenceFrom(snapshots, now);
         const sameProposalEvidence = sameIds(persisted.evidence.batches.map((batch) => batch.snapshotId),
           snapshots.filter((snapshot) => snapshot.source === 'nansen').map((snapshot) => snapshot.snapshotId)) &&

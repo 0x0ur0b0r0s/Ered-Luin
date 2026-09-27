@@ -104,7 +104,7 @@ const WETH_ASSET = 'WETH' as const;
 const UTC_DAY = /^\d{4}-\d{2}-\d{2}$/u;
 
 type SignalRequirement = {
-  readonly endpoint: 'TOKEN_SCREENER' | 'SMART_MONEY_NETFLOW';
+  readonly endpoint: 'TOKEN_SCREENER' | 'SMART_MONEY_NETFLOW' | 'TOKEN_OHLCV';
   readonly asset: 'USDC' | 'WETH';
   readonly metric: string;
   readonly freshnessMs: number;
@@ -187,7 +187,7 @@ function findSignal(
     // Malformed unrelated observations do not affect this key, but every matching raw record must validate.
     rawMatchCount += 1;
     const candidate = normalizedSignalSchema.safeParse(value);
-    if (!candidate.success || candidate.data.chainId !== 8453) {
+    if (!candidate.success || candidate.data.chainId !== 8453 || (candidate.data.endpoint === 'TOKEN_OHLCV' && (candidate.data.provider !== 'nansen' || candidate.data.timeframe !== '1m' || Date.parse(candidate.data.observedAt) + 60_000 > Date.parse(candidate.data.fetchedAt)))) {
       hasMalformedMatch = true;
       continue;
     }
@@ -201,6 +201,13 @@ function findSignal(
   if (signal.unit !== 'usd_micros' || signedMicros(signal.value) === null) return { signal, failure: 'INVALID' };
   if (!ageOk(signal.fetchedAt, nowMs, requirement.freshnessMs) || !ageOk(signal.observedAt, nowMs, requirement.freshnessMs)) return { signal, failure: 'STALE' };
   return { signal, failure: null };
+}
+function preferredUsdcPrice(signals: readonly unknown[], nowMs: number): ReturnType<typeof findSignal> {
+  const candle = findSignal(signals, { endpoint: 'TOKEN_OHLCV', asset: 'USDC', metric: 'price_usd', freshnessMs: G2_LIMITS.screenerFreshnessMs }, nowMs);
+  if (candle.failure === null) return candle;
+  const screener = findSignal(signals, { endpoint: 'TOKEN_SCREENER', asset: 'USDC', metric: 'price_usd', freshnessMs: G2_LIMITS.screenerFreshnessMs }, nowMs);
+  if (screener.failure === null) return screener;
+  return candle.failure !== 'MISSING' ? candle : screener;
 }
 function validQuote(
   raw: PaperQuote | null,
@@ -275,15 +282,14 @@ export function evaluateG2Intent(input: G2EvaluationInput): G2Evaluation {
   if (currentEquity > G2_LIMITS.walletValueUsdcMicros) return result(intent, input.now, 'BLOCK', ['WALLET_VALUE_LIMIT_EXCEEDED']);
   if (currentPnl < -dailyLossLimit) return result(intent, input.now, 'BLOCK', ['DAILY_LOSS_LIMIT_EXCEEDED']);
   const walletSources: Array<'nansen' | 'synthetic'> = [];
-  const screenerReqs: readonly SignalRequirement[] = [
-    { endpoint: 'TOKEN_SCREENER', asset: 'USDC', metric: 'price_usd', freshnessMs: G2_LIMITS.screenerFreshnessMs },
-    { endpoint: 'TOKEN_SCREENER', asset: 'WETH', metric: 'price_usd', freshnessMs: G2_LIMITS.screenerFreshnessMs },
+  const requiredSignals = [
+    preferredUsdcPrice(input.signals, nowMs),
+    findSignal(input.signals, { endpoint: 'TOKEN_SCREENER', asset: 'WETH', metric: 'price_usd', freshnessMs: G2_LIMITS.screenerFreshnessMs }, nowMs),
   ];
-  const requiredSignals = screenerReqs.map((requirement) => findSignal(input.signals, requirement, nowMs));
   const signalIds = requiredSignals.flatMap((candidate) => candidate.signal ? [candidate.signal.signalId] : []);
   for (const candidate of requiredSignals) if (candidate.signal) walletSources.push(candidate.signal.provider);
   const badSignal = requiredSignals.find((candidate) => candidate.failure !== null);
-  if (badSignal) return result(intent, input.now, 'REQUIRE_REVIEW', [`SCREENER_${badSignal.failure}`], { signalIds, signalSource: sourceOf(walletSources) });
+  if (badSignal) return result(intent, input.now, 'REQUIRE_REVIEW', ['SCREENER_' + badSignal.failure], { signalIds, signalSource: sourceOf(walletSources) });
   for (const candidate of requiredSignals) {
     const value = BigInt(candidate.signal!.value!);
     if (value <= 0n) return result(intent, input.now, 'REQUIRE_REVIEW', ['NONPOSITIVE_SPOT_PRICE'], { signalIds, signalSource: sourceOf(walletSources) });

@@ -556,3 +556,48 @@ function runChild(script: string, args: string[]): Promise<{ exitCode: number | 
     });
   });
 }
+
+describe('D2v one-credit ledger schema migration', () => {
+  it('widens the operation check transactionally without resetting counters or the remaining cap', () => {
+    const dbPath = path('d2v-ledger-migration.sqlite');
+    const initial = initializeCreditLedger(options(dbPath, { limitCredits: 3 }));
+    ledgers.push(initial);
+    for (const id of ['previous-screener-1', 'previous-screener-2']) {
+      const reservation = initial.reserveAttempt(reserveInput(id, 'TOKEN_SCREENER', 'a'.repeat(64)));
+      expect(reservation.dispatchGranted).toBe(true);
+      initial.recordTerminalResult(terminalInput(id, { chargedCredits: 1, httpStatus: 200, providerRequestId: 'prior-' + id }));
+    }
+    const before = initial.getSnapshot();
+    initial.close();
+
+    const raw = new DatabaseSync(dbPath);
+    raw.exec('PRAGMA foreign_keys = OFF');
+    raw.exec('BEGIN IMMEDIATE');
+    const currentSql = String(raw.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'attempts'").get()?.sql);
+    const legacySql = currentSql.replace('CREATE TABLE attempts (', 'CREATE TABLE attempts_v2 (')
+      .replace(", 'TOKEN_OHLCV'", '');
+    expect(legacySql).not.toBe(currentSql);
+    raw.exec(legacySql);
+    raw.exec('INSERT INTO attempts_v2 SELECT * FROM attempts');
+    raw.exec('DROP TABLE attempts');
+    raw.exec('ALTER TABLE attempts_v2 RENAME TO attempts');
+    raw.exec('UPDATE ledger_meta SET schema_version = 2 WHERE singleton = 1');
+    raw.exec('PRAGMA user_version = 2');
+    raw.exec('COMMIT');
+    raw.exec('PRAGMA foreign_keys = ON');
+    raw.close();
+
+    const migrated = openCreditLedger(options(dbPath, { limitCredits: 3 }));
+    ledgers.push(migrated);
+    expect(migrated.getSnapshot()).toMatchObject({ allocatedCredits: before.allocatedCredits,
+      reportedChargedCreditsTotal: before.reportedChargedCreditsTotal, reportedChargeCount: before.reportedChargeCount,
+      remainingCredits: 1, pendingAttemptCount: 0, reconciliationRequired: false });
+    expect(['previous-screener-1', 'previous-screener-2'].map((attemptId) => migrated.getAttempt(attemptId)?.operation)).toEqual(['TOKEN_SCREENER', 'TOKEN_SCREENER']);
+    expect(getReservedCredits('TOKEN_OHLCV')).toBe(1);
+    const grant = migrated.reserveAttempt(reserveInput('d2v-ohlcv-attempt-3', 'TOKEN_OHLCV', 'c'.repeat(64)));
+    expect(grant.dispatchGranted).toBe(true);
+    migrated.recordTerminalResult(terminalInput('d2v-ohlcv-attempt-3', { chargedCredits: 1, httpStatus: 200, providerRequestId: 'd2v-synthetic' }));
+    expect(migrated.getSnapshot()).toMatchObject({ allocatedCredits: 3, remainingCredits: 0, reportedChargeCount: 3,
+      reportedChargedCreditsTotal: 3, pendingAttemptCount: 0, reconciliationRequired: false });
+  });
+});

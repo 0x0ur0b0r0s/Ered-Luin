@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import { d2Api, d2bIdempotencyKey, type D2Evaluation, type D2Evidence, type D2ExecutionAction, type D2OperatorSession, type D2Proposal, type D2Runtime, type D2Session, type D2Simulation, type D2FreshAnalysisPreview, type D2FreshAnalysisResult } from './api-client.js';
+import { BrowserWalletPanel } from './browser-wallet-panel.js';
 
 function parseUsdcMicros(value: string): string | null {
   if (!/^(0|[1-9][0-9]*)(\.[0-9]{1,6})?$/u.test(value)) return null;
@@ -10,6 +11,11 @@ function parseUsdcMicros(value: string): string | null {
 function usd(value: string | null | undefined): string {
   if (!value || !/^(0|[1-9][0-9]*)$/u.test(value)) return '—';
   return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 4 })
+    .format(Number(BigInt(value)) / 1_000_000);
+}
+function nansenUsd(value: string | null): string {
+  if (value === null || !/^-?(0|[1-9][0-9]*)$/u.test(value)) return '—';
+  return new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 6 })
     .format(Number(BigInt(value)) / 1_000_000);
 }
 function shortId(value: string): string { return value.slice(0, 8) + '…' + value.slice(-4); }
@@ -46,6 +52,7 @@ export function D2ProductionPanel({ api = d2Api }: { readonly api?: typeof d2Api
   const [analysisPreview, setAnalysisPreview] = useState<D2FreshAnalysisPreview | null>(null);
   const [analysisResult, setAnalysisResult] = useState<D2FreshAnalysisResult | null>(null);
   const [evaluation, setEvaluation] = useState<D2Evaluation | null>(null);
+  const [persistedAudit, setPersistedAudit] = useState<D2Evaluation | null>(null);
   const [simulation, setSimulation] = useState<D2Simulation | null>(null);
   const [operationId, setOperationId] = useState('');
   const [execution, setExecution] = useState<D2ExecutionAction | null>(null);
@@ -61,6 +68,17 @@ export function D2ProductionPanel({ api = d2Api }: { readonly api?: typeof d2Api
   const productionReady = runtime?.productionEvaluation === 'configured';
   const authenticated = operatorSession?.authenticated === true;
 
+  useEffect(() => {
+    const proposalId = new URLSearchParams(window.location.search).get('paperEvaluation');
+    if (!proposalId || !/^[0-9a-f-]{36}$/iu.test(proposalId)) return;
+    let active = true;
+    void api.getEvaluation(proposalId).then((record) => {
+      if (active) setPersistedAudit(record);
+    }).catch(() => {
+      if (active) setPersistedAudit(null);
+    });
+    return () => { active = false; };
+  }, [api]);
   useEffect(() => {
     let active = true;
     void Promise.allSettled([api.runtime(), api.evidence(), api.operatorSession()]).then(([runtimeResult, evidenceResult, operatorResult]) => {
@@ -283,7 +301,7 @@ export function D2ProductionPanel({ api = d2Api }: { readonly api?: typeof d2Api
       <div><p className="eyebrow">D2 / Production evidence and execution controls</p><h2 id="d2-heading">Persisted evidence → policy → G3c</h2></div>
       <span className="d2-mode-chip">{runtime?.appMode ?? 'RUNTIME CHECKING'}</span>
     </div>
-    <p className="d2-intro">Uses stored Nansen observations and Base read-only adapters. Paid Nansen calls remain off. Offline acceptance uses synthetic data and mocked transports; it never creates a live receipt.</p>
+    <p className="d2-intro">Displays persisted Nansen market observations with provider timestamps. This app does not dispatch Nansen calls. Policy output is paper-only; signing, transaction submission, browser wallet and Rabby remain disabled.</p>
 
     <div className="d2-runtime-grid">
       <div><small>Observation store</small><strong>{runtime?.nansenObservationStore ?? 'checking'}</strong></div>
@@ -314,6 +332,16 @@ export function D2ProductionPanel({ api = d2Api }: { readonly api?: typeof d2Api
         {evidence?.batches.length ? evidence.batches.map((batch) => <article className="d2-batch" key={batch.snapshotId}>
           <div className="d2-batch-title"><strong>{batch.operation.replaceAll('_', ' ')}</strong><span className={'d2-freshness freshness-' + batch.status}>{batch.status}</span></div>
           <div className="d2-batch-meta"><span>Fetched {new Date(batch.fetchedAt).toLocaleString()}</span><span>Acquired {new Date(batch.acquiredAt).toLocaleString()}</span><span>{batch.completeness} · age {Math.ceil(batch.ageMs / 1000)}s</span></div>
+          <div className="d2-market-values" aria-label="Actual persisted Nansen values">
+            {evidence.observations.filter((signal) => batch.observationIds.includes(signal.signalId) && signal.value !== null && signal.quality === 'COMPLETE')
+              .map((signal) => <p className="d2-market-value" key={signal.signalId}>
+                <strong>{signal.asset} {signal.metric.replaceAll('_', ' ')}</strong>
+                <span>{nansenUsd(signal.value)} USD</span>
+                <small>Observed {new Date(signal.observedAt).toLocaleString()} · Nansen {signal.endpoint.replaceAll('_', ' ')}</small>
+              </p>)}
+          </div>
+          {batch.operation === 'TOKEN_OHLCV' && evidence.observations.filter((signal) => batch.observationIds.includes(signal.signalId) && signal.endpoint === 'TOKEN_OHLCV')
+            .map((signal) => <p className="d2-candle-note" key={signal.signalId}>Recent Nansen {batch.timeframe} candle price · interval {new Date(signal.observedAt).toLocaleString()} · not an executable swap quote.</p>)}
           <div className="d2-id-list"><small>OBSERVATION IDS</small>{batch.observationIds.map((id) => <code key={id}>{id}</code>)}</div>
           <div className="d2-page-list"><small>REQUEST ATTEMPT / PAGE REFERENCES</small>{batch.pageReferences.length ? batch.pageReferences.map((page) =>
             <code key={page.attemptId + ':' + page.page}>attempt {page.attemptId} · page {page.page} · HTTP {page.status ?? '—'} · retry {page.retry} · credits {page.chargedCredits ?? 'unknown'}</code>)
@@ -324,6 +352,13 @@ export function D2ProductionPanel({ api = d2Api }: { readonly api?: typeof d2Api
       <div className="d2-controls">
         <div className="d2-subheading"><div><p className="eyebrow">Public inputs</p><h3>Evaluation setup</h3></div></div>
         <label>Wallet public address<input value={wallet} onChange={(event) => changeWallet(event.target.value)} placeholder="0x…" autoComplete="off" /></label>
+        <BrowserWalletPanel currentWallet={wallet} sessionWallet={session?.walletAddress ?? null}
+          onAccountSelection={changeWallet}
+          onContextInvalidated={() => { invalidateSelection(); setSession(null); clearDownstream(); }}
+          api={api} proposalId={proposal?.proposalId ?? (recoveryProposalId || null)} sessionId={session?.sessionId ?? evaluation?.sessionId ?? null}
+          operationId={simulation?.operationId ?? (recoveryOperationId || null)} evaluation={evaluation} simulation={simulation}
+          authenticated={authenticated} browserWalletEnabled={runtime?.executionControls.browserWalletEnabled === true}
+          onApprovalComplete={() => { invalidateSelection(); setSession(null); clearDownstream(); }} />
         <label>Requested amount · USDC<input value={amount} onChange={(event) => changeAmount(event.target.value)} inputMode="decimal" /></label>
         <div className="d2-button-row">
           <button className="secondary-button" onClick={startSession} disabled={!authenticated || !walletValid || !rpcReady || busy !== null}
@@ -341,6 +376,19 @@ export function D2ProductionPanel({ api = d2Api }: { readonly api?: typeof d2Api
       </div>
     </div>
 
+    {persistedAudit && <div className="d2-result-card d2-persisted-audit" aria-label="Saved paper policy audit">
+      <div className="d2-subheading"><div><p className="eyebrow">Durable paper policy audit</p><h3>Recorded G2 decision</h3></div>
+        <span className={'decision-chip ' + statusClass(persistedAudit.decision.status)}>{persistedAudit.decision.status}</span></div>
+      <div className="d2-decision-grid"><div><small>REQUESTED</small><strong>{usd(persistedAudit.decision.requestedAmountIn)}</strong></div>
+        <div><small>PERMITTED</small><strong>{usd(persistedAudit.decision.approvedAmountIn)}</strong></div>
+        <div><small>MARKET EVIDENCE</small><strong>{persistedAudit.evidenceIds.length} ids · {persistedAudit.signalSource}</strong></div>
+        <div><small>EXECUTION</small><strong>paper only · no transaction</strong></div></div>
+      <div className="d2-reasons"><small>POLICY REASONS</small>{persistedAudit.decision.reasons.map((reason) =>
+        <span className="reason-chip" key={reason}>{reason.replaceAll('_', ' ')}</span>)}</div>
+      <div className="d2-audit-ids"><small>PROPOSAL / EVALUATION ID</small><code>{persistedAudit.proposalId}</code>
+        <small>DECISION ID</small><code>{persistedAudit.decision.decisionId}</code>
+        <small>OBSERVATION IDS</small><span>{persistedAudit.evidenceIds.length} persisted Nansen records</span></div>
+    </div>}
     {proposal && <div className="d2-result-card">
       <div className="d2-subheading"><div><p className="eyebrow">Deterministic proposal · optional stored advisory reference</p><h3>Candidate and linked evidence</h3></div><span className="proposal-only">PROPOSAL ONLY</span></div>
       <p>{proposal.analysis.rationale}</p>

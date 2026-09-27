@@ -2,12 +2,13 @@ import { closeSync, lstatSync, openSync } from 'node:fs';
 import { isAbsolute } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-export const LEDGER_SCHEMA_VERSION = 2 as const;
+export const LEDGER_SCHEMA_VERSION = 3 as const;
 export const NANSEN_COST_PROFILE_VERSION = 'nansen-2026-09-22-v1' as const;
 export const NANSEN_OPERATION_COSTS = Object.freeze({
   TOKEN_SCREENER: 1,
   FLOW_INTELLIGENCE: 1,
   SMART_MONEY_NETFLOW: 5,
+  TOKEN_OHLCV: 1,
 } as const);
 export const SQLITE_BUSY_TIMEOUT_MS = 5_000;
 
@@ -184,7 +185,7 @@ const ATTEMPTS_SQL = [
   'attempt_id TEXT PRIMARY KEY CHECK (length(attempt_id) BETWEEN 1 AND 128),',
   'budget_id TEXT NOT NULL REFERENCES ledger_meta(budget_id),',
   'profile_version TEXT NOT NULL CHECK (length(profile_version) BETWEEN 1 AND 64),',
-  "operation TEXT NOT NULL CHECK (operation IN ('TOKEN_SCREENER', 'FLOW_INTELLIGENCE', 'SMART_MONEY_NETFLOW')),",
+  "operation TEXT NOT NULL CHECK (operation IN ('TOKEN_SCREENER', 'FLOW_INTELLIGENCE', 'SMART_MONEY_NETFLOW', 'TOKEN_OHLCV')),",
   "request_fingerprint TEXT NOT NULL CHECK (length(request_fingerprint) = 64 AND request_fingerprint NOT GLOB '*[^0-9a-f]*'),",
   "reserved_credits INTEGER NOT NULL CHECK (typeof(reserved_credits) = 'integer' AND reserved_credits > 0),",
   "charged_credits INTEGER CHECK (charged_credits IS NULL OR (typeof(charged_credits) = 'integer' AND charged_credits >= 0)),",
@@ -196,6 +197,8 @@ const ATTEMPTS_SQL = [
   'CHECK ((outcome IS NULL AND completed_at_ms IS NULL AND http_status IS NULL AND provider_request_id IS NULL AND charged_credits IS NULL) OR (outcome IS NOT NULL AND completed_at_ms IS NOT NULL))',
   ') STRICT',
 ].join('\n');
+
+const ATTEMPTS_V2_SQL = ATTEMPTS_SQL.replace(`, 'TOKEN_OHLCV'`, '');
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -357,7 +360,7 @@ function assertIntegrity(db: DatabaseSync): void {
   if (db.prepare('PRAGMA foreign_key_check').all().length !== 0) throw new CreditLedgerError('DATABASE_CORRUPT');
 }
 function normalizeSchemaSql(sql: string): string {
-  return sql.replace(/\\s+/g, '').toLowerCase();
+  return sql.replaceAll(String.fromCharCode(32), '').replaceAll(String.fromCharCode(10), '').replaceAll(String.fromCharCode(13), '').replaceAll(String.fromCharCode(34), '').toLowerCase();
 }
 function assertSchema(db: DatabaseSync): void {
   const rows = db.prepare(
@@ -582,6 +585,58 @@ function openExistingFile(databasePath: string): DatabaseSync {
     try { db?.close(); } catch { /* The existing file remains untouched. */ }
     throw new CreditLedgerError('DATABASE_CORRUPT');
   }
+}
+function assertLedgerV2Schema(db: DatabaseSync): void {
+  const rows = db.prepare("SELECT type, name, sql FROM sqlite_master WHERE type IN ('table', 'view', 'trigger') AND name NOT LIKE 'sqlite_%' ORDER BY name").all() as SqlRow[];
+  if (rows.length !== 2 || rows[0]?.type !== 'table' || rows[0]?.name !== 'attempts' ||
+      rows[1]?.type !== 'table' || rows[1]?.name !== 'ledger_meta') throw new CreditLedgerError('DATABASE_CORRUPT');
+  for (const table of ['ledger_meta', 'attempts'] as const) {
+    const sql = rows.find((row) => row.name === table)?.sql;
+    const expected = table === 'ledger_meta' ? META_SQL : ATTEMPTS_V2_SQL;
+    if (typeof sql !== 'string' || normalizeSchemaSql(sql) !== normalizeSchemaSql(expected)) throw new CreditLedgerError('DATABASE_CORRUPT');
+    const columns = (db.prepare('PRAGMA table_info(' + table + ')').all() as SqlRow[]).map((row) => row.name);
+    if (columns.length !== COLUMNS[table].length || columns.some((name, i) => name !== COLUMNS[table][i])) {
+      throw new CreditLedgerError('DATABASE_CORRUPT');
+    }
+  }
+}
+
+function migrateLedgerV2(db: DatabaseSync, config: NormalizedLedgerOptions): void {
+  const version = getSqlRow(db.prepare('PRAGMA user_version'));
+  if (version?.user_version !== 2n) {
+    if (version?.user_version === BigInt(LEDGER_SCHEMA_VERSION)) return;
+    if (version?.user_version === 0n) throw new CreditLedgerError('DATABASE_CORRUPT');
+    throw new CreditLedgerError('UNSUPPORTED_SCHEMA_VERSION');
+  }
+  assertIntegrity(db);
+  db.exec('PRAGMA foreign_keys = OFF');
+  try {
+    transaction(db, 'IMMEDIATE', () => {
+      const currentVersion = getSqlRow(db.prepare('PRAGMA user_version'));
+      if (currentVersion?.user_version !== 2n) throw new CreditLedgerError('UNSUPPORTED_SCHEMA_VERSION');
+      assertLedgerV2Schema(db);
+      const meta = getSqlRow(db.prepare('SELECT schema_version, budget_id, limit_credits, profile_version FROM ledger_meta WHERE singleton = 1'));
+      if (!meta || safeSqlInteger(meta.schema_version) !== 2 || meta.budget_id !== config.budgetId ||
+          safeSqlInteger(meta.limit_credits) !== config.limitCredits || meta.profile_version !== config.costProfileVersion) {
+        throw new CreditLedgerError('CONFIGURATION_MISMATCH');
+      }
+      const before = safeSqlInteger(getSqlRow(db.prepare('SELECT COUNT(*) AS count FROM attempts'))?.count);
+      const replacement = ATTEMPTS_SQL.replace('CREATE TABLE attempts (', 'CREATE TABLE attempts_v3 (');
+      if (replacement === ATTEMPTS_SQL) throw new CreditLedgerError('DATABASE_FAILURE');
+      db.exec(replacement);
+      db.exec('INSERT INTO attempts_v3 SELECT * FROM attempts');
+      db.exec('DROP TABLE attempts');
+      db.exec('ALTER TABLE attempts_v3 RENAME TO attempts');
+      db.prepare('UPDATE ledger_meta SET schema_version = ? WHERE singleton = 1').run(LEDGER_SCHEMA_VERSION);
+      db.exec('PRAGMA user_version = ' + LEDGER_SCHEMA_VERSION);
+      const after = safeSqlInteger(getSqlRow(db.prepare('SELECT COUNT(*) AS count FROM attempts'))?.count);
+      if (before !== after) throw new CreditLedgerError('DATABASE_CORRUPT');
+    });
+  } finally {
+    db.exec('PRAGMA foreign_keys = ON');
+  }
+  assertIntegrity(db);
+  assertSchema(db);
 }
 function verifyConfig(db: DatabaseSync, config: NormalizedLedgerOptions): void {
   transaction(db, 'DEFERRED', () => { readState(db, config); });
@@ -809,6 +864,7 @@ export function openCreditLedger(options: LedgerOptions): NansenCreditLedger {
   const config = normalizeOptions(options);
   const db = openExistingFile(config.databasePath);
   try {
+    migrateLedgerV2(db, config);
     verifyConfig(db, config);
     return new NansenCreditLedger(db, config);
   } catch (error) {
@@ -821,10 +877,10 @@ export function openCreditLedger(options: LedgerOptions): NansenCreditLedger {
 export { createNansenClient, NansenClientError, BASE_ASSET_ADDRESSES } from './client.js';
 export type {
   NansenCallOptions, NansenClientErrorCode, NansenClientOptions, NansenHttpRequest,
-  NansenHttpResponse, NansenHttpTransport, AdapterCompleteness, AdapterEvidenceDiagnostics, EvidenceFieldName, EvidenceFieldState, AdapterFailure, AdapterResult,
+  NansenHttpResponse, NansenHttpTransport, NansenRawResponseObservation, AdapterCompleteness, AdapterEvidenceDiagnostics, EvidenceFieldName, EvidenceFieldState, AdapterFailure, AdapterResult,
   BaseEvidenceAsset, FlowIntelligenceQuery, FlowIntelligenceRow, FlowIntelligenceTimeframe,
   NansenClient, PageReference, SmartMoneyNetflowQuery, SmartMoneyNetflowToken,
-  TokenScreenerQuery, TokenScreenerTimeframe, TokenScreenerToken,
+  TokenScreenerQuery, TokenScreenerTimeframe, TokenScreenerToken, TokenOhlcvAdapterResult, TokenOhlcvCandle, TokenOhlcvDateRange, TokenOhlcvQuery, TokenOhlcvTimeframe,
 } from './client.js';
 export * from './observation-store.js';
 export * from './query-manager.js';

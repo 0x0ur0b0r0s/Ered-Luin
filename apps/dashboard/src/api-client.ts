@@ -16,8 +16,9 @@ import {
   d2ExecutionActionResponseSchema,
   d2AnalysisPreviewSchema,
   d2AnalysisInvokeSchema,
+  d2BrowserExecutionActionResponseSchema, d2BrowserAllowancePreflightResponseSchema,
   type D2AnalysisPreview,
-  type D2AnalysisInvoke,
+  type D2AnalysisInvoke, type D2BrowserAllowancePreflightResponse,
   type D1G3cFixture,
   type D1G3cStatusName,
   type D1Proposal,
@@ -34,6 +35,8 @@ export type D2Session = ReturnType<typeof d2SessionResponseSchema.parse>;
 export type D2Simulation = ReturnType<typeof d2SimulationSchema.parse>;
 export type D2OperatorSession = ReturnType<typeof d2OperatorSessionSchema.parse>;
 export type D2ExecutionAction = ReturnType<typeof d2ExecutionActionResponseSchema.parse>;
+export type D2BrowserExecutionAction = ReturnType<typeof d2BrowserExecutionActionResponseSchema.parse>;
+export type D2BrowserAllowancePreflight = D2BrowserAllowancePreflightResponse;
 export type D2FreshAnalysisPreview = D2AnalysisPreview;
 export type D2FreshAnalysisResult = D2AnalysisInvoke;
 
@@ -110,6 +113,7 @@ export function createD2ApiClient(fetcher: typeof fetch = fetch) {
       fetcher, '/v1/operator/logout', d2OperatorSessionSchema, post(fetcher, '/v1/operator/logout', {}),
     ),
     evidence: () => responseBody(fetcher, '/v1/production/evidence', d2EvidenceResponseSchema),
+    getEvaluation: (proposalId: string): Promise<D2Evaluation> => responseBody(fetcher, '/v1/production/evaluations/' + encodeURIComponent(proposalId), d2EvaluationSchema),
     analysisPreview: (proposalId: string): Promise<D2FreshAnalysisPreview> => responseBody(
       fetcher, '/v1/production/analysis/preview', d2AnalysisPreviewSchema, post(fetcher, '/v1/production/analysis/preview', { proposalId }),
     ),
@@ -137,7 +141,40 @@ export function createD2ApiClient(fetcher: typeof fetch = fetch) {
     ),
     simulation: (proposalId: string): Promise<D2Simulation> =>
       responseBody(fetcher, '/v1/production/proposals/' + encodeURIComponent(proposalId) + '/simulation', d2SimulationSchema),
-    prepareSign: (proposalId: string, operationId: string, sessionId: string, idempotencyKey: string): Promise<D2ExecutionAction> => responseBody(
+    browserCheckAllowance: (proposalId: string, operationId: string, sessionId: string): Promise<D2BrowserAllowancePreflightResponse> => responseBody(
+      fetcher, '/v1/production/browser-executions/allowance', d2BrowserAllowancePreflightResponseSchema,
+      post(fetcher, '/v1/production/browser-executions/allowance', { proposalId, operationId, sessionId }),
+    ),    browserPrepare: (proposalId: string, operationId: string, sessionId: string): Promise<D2BrowserExecutionAction> => responseBody(
+      fetcher, '/v1/production/browser-executions/prepare', d2BrowserExecutionActionResponseSchema,
+      post(fetcher, '/v1/production/browser-executions/prepare', { proposalId, operationId, sessionId }),
+    ),
+    browserPrepareApproval: (proposalId: string, operationId: string, sessionId: string): Promise<D2BrowserExecutionAction> => responseBody(
+      fetcher, '/v1/production/browser-executions/approval/prepare', d2BrowserExecutionActionResponseSchema,
+      post(fetcher, '/v1/production/browser-executions/approval/prepare', { proposalId, operationId, sessionId }),
+    ),
+    browserCompleteApproval: (proposalId: string, operationId: string, sessionId: string): Promise<D2BrowserExecutionAction> => responseBody(
+      fetcher, '/v1/production/browser-executions/approval/complete', d2BrowserExecutionActionResponseSchema,
+      post(fetcher, '/v1/production/browser-executions/approval/complete', { proposalId, operationId, sessionId }),
+    ),    browserBegin: (proposalId: string, operationId: string, sessionId: string): Promise<D2BrowserExecutionAction> => responseBody(
+      fetcher, '/v1/production/browser-executions/begin', d2BrowserExecutionActionResponseSchema,
+      post(fetcher, '/v1/production/browser-executions/begin', { proposalId, operationId, sessionId }),
+    ),
+    browserAttachHash: (proposalId: string, operationId: string, transactionHash: string): Promise<D2BrowserExecutionAction> => responseBody(
+      fetcher, '/v1/production/browser-executions/hash', d2BrowserExecutionActionResponseSchema,
+      post(fetcher, '/v1/production/browser-executions/hash', { proposalId, operationId, transactionHash }),
+    ),
+    browserReconcile: (proposalId: string, operationId: string): Promise<D2BrowserExecutionAction> => responseBody(
+      fetcher, '/v1/production/browser-executions/reconcile', d2BrowserExecutionActionResponseSchema,
+      post(fetcher, '/v1/production/browser-executions/reconcile', { proposalId, operationId }),
+    ),
+    browserReject: (proposalId: string, operationId: string, reason: 'USER_REJECTED' | 'PRE_SEND_CONTEXT_CHANGED'): Promise<D2BrowserExecutionAction> => responseBody(
+      fetcher, '/v1/production/browser-executions/reject', d2BrowserExecutionActionResponseSchema,
+      post(fetcher, '/v1/production/browser-executions/reject', { proposalId, operationId, reason }),
+    ),
+    browserStatus: (proposalId: string, operationId: string): Promise<D2BrowserExecutionAction> => responseBody(
+      fetcher, '/v1/production/browser-executions/' + encodeURIComponent(proposalId) + '/' + encodeURIComponent(operationId),
+      d2BrowserExecutionActionResponseSchema, { credentials: 'same-origin' },
+    ),    prepareSign: (proposalId: string, operationId: string, sessionId: string, idempotencyKey: string): Promise<D2ExecutionAction> => responseBody(
       fetcher, '/v1/production/executions/prepare-sign', d2ExecutionActionResponseSchema,
       post(fetcher, '/v1/production/executions/prepare-sign', { proposalId, operationId, sessionId, idempotencyKey }),
     ),

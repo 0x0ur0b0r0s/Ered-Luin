@@ -3,10 +3,10 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { keccak256, stringToHex, type Hex } from 'viem';
+import { keccak256, parseTransaction, stringToHex, type Hex } from 'viem';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import {
-  canonicalJson, g3cStatusResponseSchema, normalizedSignalSchema, type D2Runtime, type ExecutionTransactionEnvelope,
+  canonicalJson, g3cStatusResponseSchema, normalizedSignalSchema, type D2Runtime, type ExecutionTransactionEnvelope, type G3bUnsignedTransaction,
 } from '@ered-luin/contracts';
 import type { ObservationSnapshot } from '@ered-luin/nansen';
 import { initializeD2AuditStore, openD2AuditStore } from './d2-audit-store.js';
@@ -14,6 +14,7 @@ import { createD2ProductionService } from './d2-production.js';
 import { createD2ExecutionService } from './d2-execution.js';
 import { createSyntheticIsolatedG3cSigner } from './g3c-signer-client.js';
 import { createApiApp } from './api.js';
+import { createD2BrowserExecutionService } from './d2-browser-execution.js';
 import { LocalOperatorAuthenticator } from './operator-auth.js';
 import { BASE_TOKENS, BASE_UNISWAP_V3 } from './base-allowlist.js';
 import { BaseD2PolicyProvider } from './d2-base-provider.js';
@@ -37,7 +38,7 @@ const QUOTE_PRICE = (1n << 96n) / 20_000n;
 const RUNTIME: D2Runtime = {
   service: 'ered-luin-api', status: 'ok', appMode: 'PRODUCTION_READ_ONLY',
   paidNansenCallsEnabled: false, activeNansenCreditBudget: 0, liveExecutionEnabled: false,
-  executionControls: { operatorAuthConfigured: true, signingEnabled: false, submissionEnabled: false, reviewedMode: false },
+  executionControls: { operatorAuthConfigured: true, signingEnabled: false, submissionEnabled: false, reviewedMode: false, browserWalletEnabled: false },
   nansenObservationStore: 'configured', productionEvaluation: 'configured',
   baseRpc: 'read_only_enabled', g3cStatusReader: 'configured', rpcRunBudget: null,
 };
@@ -46,7 +47,7 @@ function hashFor(number: bigint): Hex { return ('0x' + number.toString(16).padSt
 function word(value: bigint): string { return value.toString(16).padStart(64, '0'); }
 function addressWord(value: string): string { return value.toLowerCase().replace(/^0x/u, '').padStart(64, '0'); }
 function selector(signature: string): string { return keccak256(stringToHex(signature)).slice(0, 10).toLowerCase(); }
-function snapshots(): readonly ObservationSnapshot[] {
+function snapshots(netflowValue = '1000000'): readonly ObservationSnapshot[] {
   const fetchedAt = new Date(NOW.getTime() - 1_000).toISOString();
   const acquiredAt = new Date(Date.parse(fetchedAt) + 1_000).toISOString();
   const expiresAt = new Date(Date.parse(fetchedAt) + 10 * 60_000).toISOString();
@@ -60,7 +61,7 @@ function snapshots(): readonly ObservationSnapshot[] {
   const signals = [
     signal('TOKEN_SCREENER', 'USDC', 'price_usd', '1000000', 1),
     signal('TOKEN_SCREENER', 'WETH', 'price_usd', '2500000000', 2),
-    signal('SMART_MONEY_NETFLOW', 'WETH', 'net_flow_1h_usd', '1000000', 3),
+    signal('SMART_MONEY_NETFLOW', 'WETH', 'net_flow_1h_usd', netflowValue, 3),
   ];
   const group = (operation: ObservationSnapshot['operation'], asset: ObservationSnapshot['asset'],
     members: readonly ObservationSnapshot['signals'][number][], index: number): ObservationSnapshot => ({
@@ -79,8 +80,9 @@ function mockProductionTransport(walletAddress: string = WALLET, initialAllowanc
   const calls: string[] = [];
   let failFinalizedAccount = false;
   let allowanceAtomic = initialAllowance;
+  let receiptStatus = '0x1';
   let pendingNonce = 0n;
-  const submissions = new Map<string, { readonly raw: Hex; readonly nonce: bigint }>();
+  const submissions = new Map<string, { readonly raw: Hex; readonly nonce: bigint; readonly transaction?: G3bUnsignedTransaction }>();
   const signatures = {
     getPool: selector('getPool(address,address,uint24)'),
     token0: selector('token0()'),
@@ -160,22 +162,32 @@ function mockProductionTransport(walletAddress: string = WALLET, initialAllowanc
     if (request.method === 'eth_getTransactionByHash') {
       const txHash = String(params[0]).toLowerCase();
       const submitted = submissions.get(txHash);
-      return { jsonrpc: '2.0', id: request.id, result: submitted ? {
-        blockHash: null, blockNumber: null, from: walletAddress, gas: '0x1d4c0', hash: String(params[0]),
-        input: '0x', nonce: '0x' + submitted.nonce.toString(16), to: BASE_UNISWAP_V3.router, transactionIndex: null,
-        value: '0x0', type: '0x2', chainId: '0x2105', maxFeePerGas: '0x11e1a300',
-        maxPriorityFeePerGas: '0x05f5e100', accessList: [], r: '0x' + '01'.padStart(64, '0'),
-        s: '0x' + '01'.padStart(64, '0'), v: '0x0', yParity: '0x0',
-      } : null };
+      if (!submitted) return { jsonrpc: '2.0', id: request.id, result: null };
+      const parsed: Record<string, unknown> = submitted.transaction ? {
+        chainId: submitted.transaction.chainId, from: submitted.transaction.from, to: submitted.transaction.to,
+        input: submitted.transaction.data, nonce: Number(submitted.transaction.nonce), gas: BigInt(submitted.transaction.gasLimit),
+        value: BigInt(submitted.transaction.valueWei), maxFeePerGas: BigInt(submitted.transaction.maxFeePerGasWei),
+        maxPriorityFeePerGas: BigInt(submitted.transaction.maxPriorityFeePerGasWei), accessList: [],
+        r: '0x' + '01'.padStart(64, '0'), s: '0x' + '01'.padStart(64, '0'), v: 0n, yParity: 0,
+      } : parseTransaction(submitted.raw) as unknown as Record<string, unknown>;
+      const quantity = (value: unknown) => typeof value === 'bigint' || typeof value === 'number'
+        ? '0x' + BigInt(value).toString(16) : value;
+      return { jsonrpc: '2.0', id: request.id, result: {
+        blockHash: null, blockNumber: null, from: parsed.from ?? walletAddress, gas: quantity(parsed.gas), hash: String(params[0]),
+        input: parsed.input ?? parsed.data ?? '0x', nonce: quantity(parsed.nonce), to: parsed.to, transactionIndex: null,
+        value: quantity(parsed.value ?? 0n), type: '0x2', chainId: quantity(parsed.chainId),
+        maxFeePerGas: quantity(parsed.maxFeePerGas), maxPriorityFeePerGas: quantity(parsed.maxPriorityFeePerGas),
+        accessList: parsed.accessList ?? [], r: parsed.r, s: parsed.s, v: quantity(parsed.v), yParity: quantity(parsed.yParity),
+      } };
     }
     if (request.method === 'eth_getTransactionReceipt') {
       const txHash = String(params[0]).toLowerCase();
       const submitted = submissions.get(txHash);
       return { jsonrpc: '2.0', id: request.id, result: submitted ? {
         transactionHash: String(params[0]), transactionIndex: '0x0', blockHash: hashFor(RECEIPT_BLOCK),
-        blockNumber: '0x' + RECEIPT_BLOCK.toString(16), from: walletAddress, to: BASE_UNISWAP_V3.router,
+        blockNumber: '0x' + RECEIPT_BLOCK.toString(16), from: submitted.transaction?.from ?? walletAddress, to: submitted.transaction?.to ?? BASE_UNISWAP_V3.router,
         cumulativeGasUsed: '0x5208', gasUsed: '0x5208', effectiveGasPrice: '0x0bebc200',
-        status: '0x1', logs: [], logsBloom: '0x' + '00'.repeat(256), type: '0x2',
+        status: receiptStatus, logs: [], logsBloom: '0x' + '00'.repeat(256), type: '0x2',
       } : null };
     }
     if (request.method === 'eth_getRawTransactionByHash') {
@@ -197,8 +209,10 @@ function mockProductionTransport(walletAddress: string = WALLET, initialAllowanc
     calls, fetcher,
     setFailFinalizedAccount(value: boolean) { failFinalizedAccount = value; },
     setAllowance(value: bigint) { allowanceAtomic = value; },
-    setKnownSubmission(hash: Hex, raw: Hex, nonce: bigint) {
-      submissions.set(hash.toLowerCase(), { raw, nonce });
+    setReceiptStatus(value: '0x0' | '0x1') { receiptStatus = value; },
+    allowance() { return allowanceAtomic; },
+    setKnownSubmission(hash: Hex, raw: Hex, nonce: bigint, transaction?: G3bUnsignedTransaction) {
+      submissions.set(hash.toLowerCase(), { raw, nonce, ...(transaction ? { transaction } : {}) });
       if (pendingNonce <= nonce) pendingNonce = nonce + 1n;
     },
     setSubmission(raw: Hex) {
@@ -211,9 +225,10 @@ function mockProductionTransport(walletAddress: string = WALLET, initialAllowanc
 }
 
 function setup(options: { readonly d2b?: boolean; readonly initialAllowance?: bigint;
-  readonly signingEnabled?: boolean; readonly submissionEnabled?: boolean; readonly rpcMaxRequests?: number; readonly rpcRecoveryReserve?: number } = {}) {
+  readonly signingEnabled?: boolean; readonly submissionEnabled?: boolean; readonly rpcMaxRequests?: number; readonly rpcRecoveryReserve?: number; readonly browserWallet?: boolean; readonly netflowValue?: string } = {}) {
   const directory = mkdtempSync(join(tmpdir(), 'ered-luin-d2-provider-integration-'));
-  const clock = () => new Date(NOW);
+  let currentTimeMs = NOW.getTime();
+  const clock = () => new Date(currentTimeMs);
   const walletPrivateKey = options.d2b ? generatePrivateKey() : null;
   const walletAddress = walletPrivateKey ? privateKeyToAccount(walletPrivateKey).address : WALLET;
   const paperPath = join(directory, 'paper.sqlite');
@@ -273,7 +288,6 @@ function setup(options: { readonly d2b?: boolean; readonly initialAllowance?: bi
     status(executionId: string) {
       if (recovery?.executionId === executionId) {
         const parent = execution.get(executionId);
-      transport.setKnownSubmission(SUBMITTED_HASH, '0x02c0' as Hex, 0n);
         return g3cStatusResponseSchema.parse({
           executionId, inputAsset: parent.intent.sellAsset, requestedAmount: parent.intent.amountIn,
           permittedAmount: parent.decision.approvedAmountIn, policyReason: 'PREEXISTING_SYNTHETIC_SUBMISSION_FIXTURE',
@@ -288,8 +302,8 @@ function setup(options: { readonly d2b?: boolean; readonly initialAllowance?: bi
 
   const auditPath = join(directory, 'd2-audit.sqlite');
   const audit = initializeD2AuditStore({ databasePath: auditPath });
-  const observations = { getLatestSnapshots: () => snapshots() };
-  const activeG3c = options.d2b ? realG3c : g3cFacade;
+  const observations = { getLatestSnapshots: () => snapshots(options.netflowValue) };
+  const activeG3c = options.d2b || options.browserWallet ? realG3c : g3cFacade;
   const policyProvider = new BaseD2PolicyProvider({
     provider, store: activeG3c as never, trust: authority.trust, clock,
   });
@@ -336,25 +350,28 @@ function setup(options: { readonly d2b?: boolean; readonly initialAllowance?: bi
     production, store: realG3c, provider, ...(signer ? { signer } : {}), ...(broadcaster ? { broadcaster } : {}),
     signingEnabled: options.signingEnabled ?? true, submissionEnabled: options.submissionEnabled ?? true, clock,
   }) : undefined;
+  const browserExecution = options.browserWallet ? createD2BrowserExecutionService({ production, store: realG3c, provider, enabled: true, clock }) : undefined;
   const app = createApiApp({
     store: paper, d2Production: production, g3cStatusReader: activeG3c, ...(d2Execution ? { d2Execution } : {}),
+    ...(browserExecution ? { d2BrowserExecution: browserExecution } : {}),
     d2Runtime: () => d2Execution ? {
       ...RUNTIME, executionControls: { operatorAuthConfigured: true, signingEnabled: d2Execution.signingEnabled,
-        submissionEnabled: d2Execution.submissionEnabled, reviewedMode: false },
-    } : RUNTIME, operatorAuth, clock,
+        submissionEnabled: d2Execution.submissionEnabled, reviewedMode: false, browserWalletEnabled: options.browserWallet === true },
+    } : options.browserWallet ? { ...RUNTIME, liveExecutionEnabled: true, appMode: 'LIVE_REVIEWED', executionControls: { ...RUNTIME.executionControls, browserWalletEnabled: true } } : RUNTIME, operatorAuth, clock,
   });
   return {
     directory, paperPath, auditPath, paper, execution, realG3c, authority, budget, transport, operatorHeaders, walletAddress,
+    setClock: (date: Date) => { currentTimeMs = date.getTime(); },
     provider, policyProvider, production, g3cFacade, d2Execution, app, broadcaster, getSignerCalls: () => signerCalls, getBroadcasterCalls: () => broadcasterCalls,
     getBroadcastBytes: () => [...broadcastBytes], setNextBroadcastGate: (gate: () => Promise<void>) => { nextBroadcastGate = gate; },
     loseNextBroadcastResponse: () => { failNextBroadcastResponse = true; },
     seedSubmission(executionId: string, operationId: string) {
-      const parent = execution.get(executionId);
-      transport.setKnownSubmission(SUBMITTED_HASH, '0x02c0' as Hex, 0n);
-      const unsignedTransaction = {
-        from: WALLET, nonce: '0', to: BASE_UNISWAP_V3.router,
-        amountIn: parent.transaction.amountIn,
+      const unsignedTransaction: G3bUnsignedTransaction = {
+        version: 1, type: 'EIP1559', chainId: 8453, from: WALLET, to: BASE_UNISWAP_V3.router,
+        data: '0x1234', valueWei: '0', nonce: '0', gasLimit: '120000', maxFeePerGasWei: '300000000',
+        maxPriorityFeePerGasWei: '100000000', accessList: [],
       };
+      transport.setKnownSubmission(SUBMITTED_HASH, '0x02c0' as Hex, 0n, unsignedTransaction);
       recovery = {
         executionId, operationId, status: 'PENDING', reserved: true, receipt: null,
         fees: null, receiptWrites: 0,
@@ -410,7 +427,7 @@ describe('D2 provider-backed application integration', () => {
       const runtime = await h.app.inject({ method: 'GET', url: '/v2/runtime' });
       expect(runtime.statusCode).toBe(200);
       expect(runtime.json().executionControls).toMatchObject({
-        signingEnabled: false, submissionEnabled: false, reviewedMode: false,
+        signingEnabled: false, submissionEnabled: false, reviewedMode: false, browserWalletEnabled: false,
       });
       expect(runtime.json()).toMatchObject({ paidNansenCallsEnabled: false, activeNansenCreditBudget: 0, liveExecutionEnabled: false });
 
@@ -1015,5 +1032,254 @@ describe('D2 provider-backed application integration', () => {
       expect(h.transport.calls).toHaveLength(rpcCallsAtSettlement);
       expect(h.budget.snapshot().regularRequests).toBe(maxRegular);
     } finally { await h.close(); }
+  });
+});
+
+describe('enabled D2 Rabby workflow integration', () => {
+  afterEach(() => { vi.unstubAllGlobals(); });
+
+  it('creates the browser workflow from the real reservation and read-only simulation; BLOCK, stale and mismatched inputs stay before Rabby', async () => {
+    const h = setup({ browserWallet: true });
+    const walletSubmissions = 0;
+    try {
+      await startSession(h);
+      const proposal = await createProposal(h);
+      const decision = await evaluate(h, proposal.proposalId);
+      expect(['ALLOW', 'RESIZE']).toContain(decision.decision.status);
+      await reserve(h, proposal.proposalId);
+      const operationId = randomUUID();
+      const allowance = await h.app.inject({ headers: h.operatorHeaders, method: 'POST', url: '/v1/production/browser-executions/allowance',
+        payload: { proposalId: proposal.proposalId, operationId, sessionId: SESSION_ID } });
+      expect(allowance.statusCode, JSON.stringify(allowance.json())).toBe(200);
+      expect(allowance.json()).toMatchObject({ status: 'ALLOWANCE_SUFFICIENT', chainId: 8453, requiredAmountAtomic: '4000000' });
+      const simulated = await h.app.inject({ headers: h.operatorHeaders, method: 'POST', url: '/v1/production/executions/simulate',
+        payload: { proposalId: proposal.proposalId, sessionId: SESSION_ID, operationId } });
+      expect(simulated.statusCode, JSON.stringify(simulated.json())).toBe(201);
+      expect(simulated.json()).toMatchObject({ executionMode: 'READ_ONLY', authorizationCreated: false, signerInvocations: 0, broadcasterInvocations: 0 });
+      expect(() => h.realG3c.getWorkflow(operationId)).toThrow();
+      const prepared = await h.app.inject({ headers: h.operatorHeaders, method: 'POST', url: '/v1/production/browser-executions/prepare',
+        payload: { proposalId: proposal.proposalId, operationId, sessionId: SESSION_ID } });
+      expect(prepared.statusCode, JSON.stringify(prepared.json())).toBe(201);
+      expect(prepared.json()).toMatchObject({ kind: 'SWAP', browserStage: 'READY', status: 'AUTHORIZED' });
+      expect(h.realG3c.getWorkflow(operationId)).toMatchObject({ submissionMode: 'BROWSER_WALLET', browserStage: 'READY' });
+
+      const mismatchedOperation = await h.app.inject({ headers: h.operatorHeaders, method: 'POST', url: '/v1/production/browser-executions/prepare',
+        payload: { proposalId: proposal.proposalId, operationId: randomUUID(), sessionId: SESSION_ID } });
+      expect(mismatchedOperation.statusCode).toBe(409);
+      const wrongSession = await h.app.inject({ headers: h.operatorHeaders, method: 'POST', url: '/v1/production/browser-executions/begin',
+        payload: { proposalId: proposal.proposalId, operationId, sessionId: randomUUID() } });
+      expect(wrongSession.statusCode).toBe(409);
+      h.setClock(new Date(NOW.getTime() + 16_000));
+      const stale = await h.app.inject({ headers: h.operatorHeaders, method: 'POST', url: '/v1/production/browser-executions/begin',
+        payload: { proposalId: proposal.proposalId, operationId, sessionId: SESSION_ID } });
+      expect(stale.statusCode).toBe(409);
+      expect(h.realG3c.getWorkflow(operationId)).toMatchObject({ status: 'AUTHORIZED', submissionAttempts: 0 });
+      expect(walletSubmissions).toBe(0);
+      h.setClock(new Date(NOW.getTime() + 11 * 60_000));
+      const staleEvidence = await h.app.inject({ headers: h.operatorHeaders, method: 'POST', url: '/v1/production/browser-executions/begin',
+        payload: { proposalId: proposal.proposalId, operationId, sessionId: SESSION_ID } });
+      expect(staleEvidence.statusCode).toBe(409);
+      expect(staleEvidence.json()).toMatchObject({ error: 'D2_BROWSER_CURRENT_NANSEN_EVIDENCE_REQUIRED' });
+      expect(walletSubmissions).toBe(0);
+      expect(h.getSignerCalls()).toBe(0);
+      expect(h.getBroadcasterCalls()).toBe(0);
+    } finally { await h.close(); }
+
+    const blocked = setup({ browserWallet: true, netflowValue: '0' });
+    try {
+      await startSession(blocked);
+      const proposal = await createProposal(blocked);
+      const decision = await evaluate(blocked, proposal.proposalId);
+      expect(decision.decision.status).toBe('BLOCK');
+      const reservation = await blocked.app.inject({ headers: blocked.operatorHeaders, method: 'POST', url: '/v1/production/reservations',
+        payload: { proposalId: proposal.proposalId, sessionId: SESSION_ID } });
+      expect(reservation.statusCode).toBe(409);
+      const begin = await blocked.app.inject({ headers: blocked.operatorHeaders, method: 'POST', url: '/v1/production/browser-executions/begin',
+        payload: { proposalId: proposal.proposalId, operationId: randomUUID(), sessionId: SESSION_ID } });
+      expect(begin.statusCode).toBe(409);
+      expect(blocked.getSignerCalls()).toBe(0);
+      expect(blocked.getBroadcasterCalls()).toBe(0);
+      expect(walletSubmissions).toBe(0);
+    } finally { await blocked.close(); }
+  });
+
+  it('performs exact Rabby approval, refreshes policy, then prepares and settles a distinct swap', async () => {
+    const h = setup({ browserWallet: true, initialAllowance: 0n });
+    const walletSend = vi.fn(async (transaction: G3bUnsignedTransaction, hash: Hex) => {
+      h.transport.setKnownSubmission(hash, '0x02c0' as Hex, BigInt(transaction.nonce), transaction);
+      return hash;
+    });
+    try {
+      await startSession(h);
+      const proposal = await createProposal(h, '4000000');
+      const decision = await evaluate(h, proposal.proposalId);
+      expect(['ALLOW', 'RESIZE']).toContain(decision.decision.status);
+      await reserve(h, proposal.proposalId);
+      const approvalOperationId = randomUUID();
+      const allowance = await h.app.inject({ headers: h.operatorHeaders, method: 'POST', url: '/v1/production/browser-executions/allowance',
+        payload: { proposalId: proposal.proposalId, operationId: approvalOperationId, sessionId: SESSION_ID } });
+      expect(allowance.statusCode).toBe(200);
+      expect(allowance.json()).toMatchObject({ status: 'APPROVAL_REQUIRED', currentAllowanceAtomic: '0', requiredAmountAtomic: '4000000' });
+      const approval = await h.app.inject({ headers: h.operatorHeaders, method: 'POST', url: '/v1/production/browser-executions/approval/prepare',
+        payload: { proposalId: proposal.proposalId, operationId: approvalOperationId, sessionId: SESSION_ID } });
+      expect(approval.statusCode, JSON.stringify(approval.json())).toBe(201);
+      expect(approval.json()).toMatchObject({ kind: 'APPROVAL', browserStage: 'READY', status: 'AUTHORIZED' });
+      const approvalTx = approval.json().transaction as G3bUnsignedTransaction;
+      expect(approvalTx.chainId).toBe(8453);
+      expect(approvalTx.to.toLowerCase()).toBe(BASE_TOKENS.USDC.toLowerCase());
+      expect(approvalTx.valueWei).toBe('0');
+      expect(approvalTx.data.toLowerCase()).toContain(BASE_UNISWAP_V3.router.slice(2).toLowerCase());
+      const armedApproval = await h.app.inject({ headers: h.operatorHeaders, method: 'POST', url: '/v1/production/browser-executions/begin',
+        payload: { proposalId: proposal.proposalId, operationId: approvalOperationId, sessionId: SESSION_ID } });
+      expect(armedApproval.statusCode).toBe(200);
+      expect(armedApproval.json()).toMatchObject({ kind: 'APPROVAL', browserStage: 'SUBMISSION_UNCERTAIN', submissionAttempts: 1 });
+      const approvalHash = ('0x' + 'cd'.repeat(32)) as Hex;
+      expect(await walletSend(armedApproval.json().transaction as G3bUnsignedTransaction, approvalHash)).toBe(approvalHash);
+      h.transport.setAllowance(4_000_000n);
+      const approvalAttached = await h.app.inject({ headers: h.operatorHeaders, method: 'POST', url: '/v1/production/browser-executions/hash',
+        payload: { proposalId: proposal.proposalId, operationId: approvalOperationId, transactionHash: approvalHash } });
+      expect(approvalAttached.statusCode).toBe(200);
+      const approvalReceipt = await h.app.inject({ headers: h.operatorHeaders, method: 'POST', url: '/v1/production/browser-executions/reconcile',
+        payload: { proposalId: proposal.proposalId, operationId: approvalOperationId } });
+      expect(approvalReceipt.statusCode, JSON.stringify(approvalReceipt.json())).toBe(200);
+      expect(approvalReceipt.json()).toMatchObject({ kind: 'APPROVAL', status: 'CONFIRMED', browserStage: 'CONFIRMED', receiptOutcome: 'CONFIRMED' });
+      expect(approvalReceipt.json().kind).not.toBe('SWAP');
+      expect(h.realG3c.getWorkflow(approvalOperationId).kind).toBe('APPROVAL');
+      expect(h.realG3c.getParent(proposal.proposalId).status).toBe('RESERVED');
+
+      const completed = await h.app.inject({ headers: h.operatorHeaders, method: 'POST', url: '/v1/production/browser-executions/approval/complete',
+        payload: { proposalId: proposal.proposalId, operationId: approvalOperationId, sessionId: SESSION_ID } });
+      expect(completed.statusCode, JSON.stringify(completed.json())).toBe(200);
+      expect(h.realG3c.getParent(proposal.proposalId).status).toBe('RELEASED');
+      expect(h.transport.allowance()).toBe(4_000_000n);
+
+      const nextProposal = await createProposal(h, '4000000');
+      const nextDecision = await evaluate(h, nextProposal.proposalId);
+      expect(['ALLOW', 'RESIZE']).toContain(nextDecision.decision.status);
+      await reserve(h, nextProposal.proposalId);
+      const swapOperationId = randomUUID();
+      const simulation = await h.app.inject({ headers: h.operatorHeaders, method: 'POST', url: '/v1/production/executions/simulate',
+        payload: { proposalId: nextProposal.proposalId, operationId: swapOperationId, sessionId: SESSION_ID } });
+      expect(simulation.statusCode, JSON.stringify(simulation.json())).toBe(201);
+      const swapPrepared = await h.app.inject({ headers: h.operatorHeaders, method: 'POST', url: '/v1/production/browser-executions/prepare',
+        payload: { proposalId: nextProposal.proposalId, operationId: swapOperationId, sessionId: SESSION_ID } });
+      expect(swapPrepared.statusCode, JSON.stringify(swapPrepared.json())).toBe(201);
+      expect(swapPrepared.json()).toMatchObject({ kind: 'SWAP', browserStage: 'READY' });
+      const swapArmed = await h.app.inject({ headers: h.operatorHeaders, method: 'POST', url: '/v1/production/browser-executions/begin',
+        payload: { proposalId: nextProposal.proposalId, operationId: swapOperationId, sessionId: SESSION_ID } });
+      expect(swapArmed.statusCode).toBe(200);
+      const swapHash = ('0x' + 'ef'.repeat(32)) as Hex;
+      await walletSend(swapArmed.json().transaction as G3bUnsignedTransaction, swapHash);
+      const swapAttached = await h.app.inject({ headers: h.operatorHeaders, method: 'POST', url: '/v1/production/browser-executions/hash',
+        payload: { proposalId: nextProposal.proposalId, operationId: swapOperationId, transactionHash: swapHash } });
+      expect(swapAttached.statusCode).toBe(200);
+      const settled = await h.app.inject({ headers: h.operatorHeaders, method: 'POST', url: '/v1/production/browser-executions/reconcile',
+        payload: { proposalId: nextProposal.proposalId, operationId: swapOperationId } });
+      expect(settled.statusCode, JSON.stringify(settled.json())).toBe(200);
+      expect(settled.json()).toMatchObject({ kind: 'SWAP', status: 'CONFIRMED', browserStage: 'CONFIRMED', receiptOutcome: 'CONFIRMED' });
+      expect(walletSend).toHaveBeenCalledTimes(2);
+      expect(h.getSignerCalls()).toBe(0);
+      expect(h.getBroadcasterCalls()).toBe(0);
+    } finally { await h.close(); }
+  });
+
+  it('keeps uncertain approval reserved across reload, prevents a second begin, and rejects missing, expired, rejected, and reverted paths safely', async () => {
+    const uncertain = setup({ browserWallet: true, initialAllowance: 0n });
+    let uncertainClosed = false;
+    try {
+      await startSession(uncertain);
+      const proposal = await createProposal(uncertain);
+      await evaluate(uncertain, proposal.proposalId);
+      await reserve(uncertain, proposal.proposalId);
+      const operationId = randomUUID();
+      const prepared = await uncertain.app.inject({ headers: uncertain.operatorHeaders, method: 'POST', url: '/v1/production/browser-executions/approval/prepare',
+        payload: { proposalId: proposal.proposalId, operationId, sessionId: SESSION_ID } });
+      expect(prepared.statusCode).toBe(201);
+      const armed = await uncertain.app.inject({ headers: uncertain.operatorHeaders, method: 'POST', url: '/v1/production/browser-executions/begin',
+        payload: { proposalId: proposal.proposalId, operationId, sessionId: SESSION_ID } });
+      expect(armed.statusCode).toBe(200);
+      const missingHash = await uncertain.app.inject({ headers: uncertain.operatorHeaders, method: 'POST', url: '/v1/production/browser-executions/hash',
+        payload: { proposalId: proposal.proposalId, operationId } });
+      expect(missingHash.statusCode).toBe(400);
+      const duplicateBegin = await uncertain.app.inject({ headers: uncertain.operatorHeaders, method: 'POST', url: '/v1/production/browser-executions/begin',
+        payload: { proposalId: proposal.proposalId, operationId, sessionId: SESSION_ID } });
+      expect(duplicateBegin.statusCode).toBe(409);
+      expect(uncertain.realG3c.getParent(proposal.proposalId).status).toBe('RESERVED');
+      expect(uncertain.realG3c.getWorkflow(operationId)).toMatchObject({ status: 'SUBMISSION_UNCERTAIN', submissionAttempts: 1, transactionHash: null });
+
+      await uncertain.close(true);
+      uncertainClosed = true;
+      const reopenedPaper = openPaperStore({ databasePath: uncertain.paperPath, clock: () => new Date(NOW) });
+      const reopenedExecution = new ExecutionStore(reopenedPaper);
+      const reopenedG3c = new G3cExecutionStore(reopenedExecution, uncertain.authority.trust, {}, () => new Date(NOW));
+      try {
+        expect(reopenedG3c.getWorkflow(operationId)).toMatchObject({ status: 'SUBMISSION_UNCERTAIN', submissionAttempts: 1, kind: 'APPROVAL' });
+        expect(reopenedG3c.getParent(proposal.proposalId).status).toBe('RESERVED');
+      } finally { reopenedExecution.close(); rmSync(uncertain.directory, { recursive: true, force: true }); }
+    } finally { if (!uncertainClosed) await uncertain.close(); }
+
+    const expired = setup({ browserWallet: true, initialAllowance: 0n });
+    try {
+      await startSession(expired);
+      const proposal = await createProposal(expired);
+      await evaluate(expired, proposal.proposalId);
+      await reserve(expired, proposal.proposalId);
+      const operationId = randomUUID();
+      const prepared = await expired.app.inject({ headers: expired.operatorHeaders, method: 'POST', url: '/v1/production/browser-executions/approval/prepare',
+        payload: { proposalId: proposal.proposalId, operationId, sessionId: SESSION_ID } });
+      expect(prepared.statusCode).toBe(201);
+      expired.setClock(new Date(NOW.getTime() + 60 * 60_000));
+      const begin = await expired.app.inject({ headers: expired.operatorHeaders, method: 'POST', url: '/v1/production/browser-executions/begin',
+        payload: { proposalId: proposal.proposalId, operationId, sessionId: SESSION_ID } });
+      expect(begin.statusCode).toBe(409);
+      expect(expired.realG3c.getWorkflow(operationId)).toMatchObject({ status: 'AUTHORIZED', submissionAttempts: 0 });
+      expect(expired.realG3c.getParent(proposal.proposalId).status).toBe('RESERVED');
+    } finally { await expired.close(); }
+
+    const rejected = setup({ browserWallet: true, initialAllowance: 0n });
+    try {
+      await startSession(rejected);
+      const proposal = await createProposal(rejected);
+      await evaluate(rejected, proposal.proposalId);
+      await reserve(rejected, proposal.proposalId);
+      const operationId = randomUUID();
+      await rejected.app.inject({ headers: rejected.operatorHeaders, method: 'POST', url: '/v1/production/browser-executions/approval/prepare',
+        payload: { proposalId: proposal.proposalId, operationId, sessionId: SESSION_ID } });
+      const response = await rejected.app.inject({ headers: rejected.operatorHeaders, method: 'POST', url: '/v1/production/browser-executions/reject',
+        payload: { proposalId: proposal.proposalId, operationId, reason: 'USER_REJECTED' } });
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({ kind: 'APPROVAL', browserStage: 'REJECTED', status: 'CANCELLED' });
+      expect(rejected.realG3c.getParent(proposal.proposalId).status).toBe('RELEASED');
+      expect(rejected.getSignerCalls()).toBe(0);
+      expect(rejected.getBroadcasterCalls()).toBe(0);
+    } finally { await rejected.close(); }
+
+    const reverted = setup({ browserWallet: true, initialAllowance: 0n });
+    try {
+      await startSession(reverted);
+      const proposal = await createProposal(reverted);
+      await evaluate(reverted, proposal.proposalId);
+      await reserve(reverted, proposal.proposalId);
+      const operationId = randomUUID();
+      const prepared = await reverted.app.inject({ headers: reverted.operatorHeaders, method: 'POST', url: '/v1/production/browser-executions/approval/prepare',
+        payload: { proposalId: proposal.proposalId, operationId, sessionId: SESSION_ID } });
+      const tx = prepared.json().transaction as G3bUnsignedTransaction;
+      await reverted.app.inject({ headers: reverted.operatorHeaders, method: 'POST', url: '/v1/production/browser-executions/begin',
+        payload: { proposalId: proposal.proposalId, operationId, sessionId: SESSION_ID } });
+      const hash = ('0x' + '12'.repeat(32)) as Hex;
+      reverted.transport.setKnownSubmission(hash, '0x02c0' as Hex, BigInt(tx.nonce), tx);
+      reverted.transport.setReceiptStatus('0x0');
+      const attached = await reverted.app.inject({ headers: reverted.operatorHeaders, method: 'POST', url: '/v1/production/browser-executions/hash',
+        payload: { proposalId: proposal.proposalId, operationId, transactionHash: hash } });
+      expect(attached.statusCode).toBe(200);
+      const receipt = await reverted.app.inject({ headers: reverted.operatorHeaders, method: 'POST', url: '/v1/production/browser-executions/reconcile',
+        payload: { proposalId: proposal.proposalId, operationId } });
+      expect(receipt.statusCode).toBe(200);
+      expect(receipt.json()).toMatchObject({ kind: 'APPROVAL', browserStage: 'REVERTED', status: 'REVERTED', receiptOutcome: 'REVERTED' });
+      expect(receipt.json().kind).not.toBe('SWAP');
+      expect(reverted.realG3c.getParent(proposal.proposalId).status).toBe('RELEASED');
+      expect(reverted.getSignerCalls()).toBe(0);
+      expect(reverted.getBroadcasterCalls()).toBe(0);
+    } finally { await reverted.close(); }
   });
 });

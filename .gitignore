@@ -47,6 +47,7 @@ coverage/
 !/docs/d1-local-demo.md
 !/docs/friday-demo.md
 !/docs/typesafe-development.md
+!/docs/deadline-demo-package.md
 /docs/local/
 
 playwright-report/

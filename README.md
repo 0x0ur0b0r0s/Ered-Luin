@@ -4,9 +4,11 @@ Ered Luin is a research and policy firewall for autonomous trading agents. It se
 
 ## Current status
 
-As of September 26, 2026, the offline implementation through the D2l collector repairs has been integrated. The accepted D2l repair set was verified in the launch checkout with a workspace build and 48 affected tests. The D1 resize-clock repair is implemented and awaits independent review. D2 live deployment and trading readiness are not accepted.
+As of September 27, 2026, the bounded historical Nansen runner completed 251 new unique successful requests. The conservative verified local total is 801 unique HTTP successes; this does not establish organizer qualification. The internal target is 1,050, and the public campaign page lists 1,000 calls. See the [deadline demo package](docs/deadline-demo-package.md) for the accounting basis and submission status.
 
-A bounded research collection may be running in an operator-managed local environment. Its credentials, configuration, ledger, and live status are kept outside this repository. Check the protected run manifest before assuming progress or resuming after an interruption. No organizer-confirmed qualification is claimed here.
+The earlier D2l collector is failed and has one unresolved reserved attempt. No collector is currently running. Historical evidence is stale and cannot authorize a current proposal or trade.
+
+The local dashboard and API can be run in paper/read-only mode. The browser-wallet implementation is pending Astra review; browser submission, signing, live execution, and paid Nansen calls remain disabled. No live transaction, recording, public post, external deployment, or campaign entry is claimed.
 
 ## Safety defaults
 
@@ -37,7 +39,7 @@ The focused collector suites are also available:
 
 ## Local demo
 
-Follow the [D1 local paper demo](docs/d1-local-demo.md). It runs the API and dashboard locally against synthetic observations and a paper store. The [demo guide](docs/friday-demo.md) describes what the demo shows and its limits.
+Follow the [D1 local paper demo](docs/d1-local-demo.md). It runs the API and dashboard locally against synthetic observations and a paper store. The [demo guide](docs/friday-demo.md) describes what the demo shows and its limits. The [deadline demo package](docs/deadline-demo-package.md) includes a 45–60 second synthetic rehearsal plan and a separate, gated live sequence.
 
 ## Project documents
 
@@ -46,12 +48,15 @@ Follow the [D1 local paper demo](docs/d1-local-demo.md). It runs the API and das
 - [Current handoff](docs/current-handoff.md)
 - [D1 local demo setup](docs/d1-local-demo.md)
 - [Demo guide](docs/friday-demo.md)
+- [Deadline demonstration and submission package](docs/deadline-demo-package.md)
 
 ## Current limitations
 
 - The D1 resize-clock repair still needs independent review and the local UI still needs its manual visual pass.
 - D2 production readiness is incomplete. Production provider behavior, deployment configuration, signer custody, and live operational controls have not been accepted as a whole.
-- The complete API suite has had one intermittent timeout in a synthetic Alchemy configuration test; that test passed when rerun alone with a longer timeout. See the build-state for the exact recorded result.
+- The browser-wallet implementation has not been accepted for live use; its runtime flag is off.
+- The verified local request count is below the campaign page's 1,000-call figure, and organizer qualification is unconfirmed.
+- The full API suite previously had an intermittent timeout in a synthetic Alchemy configuration test; see the build-state for the exact recorded result.
 - The ledger uses Node's built-in SQLite API, which Node currently labels a release candidate.
 - This repository does not establish that synthetic results reflect market behavior or qualify for any external program.
 

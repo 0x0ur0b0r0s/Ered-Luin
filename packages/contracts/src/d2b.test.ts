@@ -25,7 +25,7 @@ describe('D2b shared execution contracts', () => {
     expect(d2RuntimeSchema.parse({
       service: 'ered-luin-api', status: 'degraded', appMode: 'PRODUCTION_READ_ONLY',
       paidNansenCallsEnabled: false, activeNansenCreditBudget: 0, liveExecutionEnabled: false,
-      executionControls: { operatorAuthConfigured: false, signingEnabled: false, submissionEnabled: false, reviewedMode: false },
+      executionControls: { operatorAuthConfigured: false, signingEnabled: false, submissionEnabled: false, reviewedMode: false, browserWalletEnabled: false },
       nansenObservationStore: 'unconfigured', productionEvaluation: 'unconfigured', baseRpc: 'disabled',
       g3cStatusReader: 'configured', rpcRunBudget: null,
     }).executionControls).toMatchObject({ signingEnabled: false, submissionEnabled: false });

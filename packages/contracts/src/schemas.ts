@@ -24,19 +24,25 @@ export const decisionSchema = z.object({
 }).strict();
 export type Decision = z.infer<typeof decisionSchema>;
 
-export const signalKindSchema = z.enum(['TOKEN_SCREENER', 'FLOW_INTELLIGENCE', 'SMART_MONEY_NETFLOW']);
+export const signalKindSchema = z.enum(['TOKEN_SCREENER', 'FLOW_INTELLIGENCE', 'SMART_MONEY_NETFLOW', 'TOKEN_OHLCV']);
 export const normalizedSignalSchema = z.object({
   signalId: z.uuid(), provider: z.enum(['nansen', 'synthetic']), endpoint: signalKindSchema,
   chainId: z.literal(SUPPORTED_CHAIN_ID), asset: z.enum(SUPPORTED_ASSETS),
   metric: z.string().min(1).max(80), observedAt: ISO_TIMESTAMP, fetchedAt: ISO_TIMESTAMP,
+  timeframe: z.enum(['1h', '1m']).optional(),
   quality: z.enum(['COMPLETE', 'PARTIAL', 'MISSING']),
   value: z.string().regex(/^-?(0|[1-9][0-9]*)$/).nullable(),
   unit: z.enum(['atomic', 'usd_micros', 'count']), provenanceId: z.string().min(1).max(160),
 }).strict().refine(
   (s) => (s.quality === 'COMPLETE' && s.value !== null) || (s.quality !== 'COMPLETE' && s.value === null),
   { message: 'Complete signals need a value; partial and missing signals use null', path: ['value'] },
-);
-export type NormalizedSignal = z.infer<typeof normalizedSignalSchema>;
+).superRefine((signal, ctx) => {
+  if ((signal.endpoint === 'TOKEN_OHLCV' && (signal.timeframe !== '1m' || signal.asset !== 'USDC' || signal.metric !== 'price_usd' ||
+      Date.parse(signal.observedAt) % 60_000 !== 0 || Date.parse(signal.observedAt) + 60_000 > Date.parse(signal.fetchedAt))) ||
+      (signal.endpoint !== 'TOKEN_OHLCV' && signal.timeframe === '1m')) {
+    ctx.addIssue({ code: 'custom', path: ['timeframe'], message: 'Signal resolution must match its endpoint and asset' });
+  }
+});export type NormalizedSignal = z.infer<typeof normalizedSignalSchema>;
 
 export const executionModeSchema = z.enum(['PAPER', 'LIVE']);
 export const executionStatusSchema = z.enum([
@@ -154,12 +160,12 @@ export const runtimeConfigSchema = z.object({
   NANSEN_API_ENABLED: z.enum(['true', 'false']).default('false'),
   NANSEN_CREDIT_BUDGET: UNSIGNED_INTEGER_STRING.default('0'),
   LIVE_EXECUTION_ENABLED: z.enum(['true', 'false']).default('false'),
-  EXECUTION_MODE: z.enum(['paper', 'live-reviewed']).default('paper'),
+  EXECUTION_MODE: z.enum(['paper', 'live-reviewed', 'browser-wallet-reviewed']).default('paper'),
 }).strict().superRefine((c, ctx) => {
   if (c.NANSEN_API_ENABLED === 'true' && c.NANSEN_CREDIT_BUDGET === '0') {
     ctx.addIssue({ code: 'custom', path: ['NANSEN_CREDIT_BUDGET'], message: 'Nansen requests require a positive credit budget' });
   }
-  if (c.LIVE_EXECUTION_ENABLED === 'true' && c.EXECUTION_MODE !== 'live-reviewed') {
+  if (c.LIVE_EXECUTION_ENABLED === 'true' && !['live-reviewed', 'browser-wallet-reviewed'].includes(c.EXECUTION_MODE)) {
     ctx.addIssue({ code: 'custom', path: ['EXECUTION_MODE'], message: 'Live execution requires the explicit live-reviewed mode' });
   }
 });

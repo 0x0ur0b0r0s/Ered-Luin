@@ -7,7 +7,7 @@ import { normalizedSignalSchema, type NormalizedSignal } from '@ered-luin/contra
 import type { AdapterCompleteness, AdapterFailure, PageReference } from './client.js';
 import type { NansenOperation } from './index.js';
 
-export const OBSERVATION_STORE_SCHEMA_VERSION = 1 as const;
+export const OBSERVATION_STORE_SCHEMA_VERSION = 2 as const;
 export const DEFAULT_OBSERVATION_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
 export const DEFAULT_MAX_OBSERVATION_ROWS = 100_000;
 export const DEFAULT_MAX_CACHE_ENTRIES = 512;
@@ -18,7 +18,7 @@ const MAX_SNAPSHOT_ROWS = 10_000;
 const MAX_PAGE_REFERENCES = 60;
 const IDENTIFIER = /^[A-Za-z0-9._:-]{1,128}$/u;
 const HASH = /^[0-9a-f]{64}$/u;
-const ENDPOINTS = ['TOKEN_SCREENER', 'FLOW_INTELLIGENCE', 'SMART_MONEY_NETFLOW'] as const;
+const ENDPOINTS = ['TOKEN_SCREENER', 'FLOW_INTELLIGENCE', 'SMART_MONEY_NETFLOW', 'TOKEN_OHLCV'] as const;
 const COMPLETENESS = ['complete', 'incomplete', 'unknown'] as const;
 const FAILURE_CODES = [
   'DISABLED', 'CREDENTIAL_MISSING', 'INVALID_CONFIGURATION', 'INVALID_REQUEST', 'RESERVATION_DENIED',
@@ -68,12 +68,13 @@ interface StoreConfig {
 export interface StoredPageReference extends PageReference { readonly retry: number; }
 export interface ObservationSnapshotInput {
   readonly snapshotId?: string; readonly cacheKey: string; readonly operation: NansenOperation;
-  readonly asset: 'BASE_PAIR' | 'USDC' | 'WETH'; readonly timeframe: '1h'; readonly pageBound: number;
+  readonly asset: 'BASE_PAIR' | 'USDC' | 'WETH'; readonly timeframe: '1h' | '1m'; readonly pageBound: number;
   readonly retryBound: number; readonly source: 'nansen' | 'synthetic'; readonly fetchedAt: string;
   readonly acquiredAt: string; readonly expiresAt: string; readonly completeness: AdapterCompleteness;
   readonly failure: AdapterFailure | null; readonly pageReferences: readonly StoredPageReference[];
   readonly unavailableFields: readonly string[]; readonly signals: readonly NormalizedSignal[];
 }
+export interface ObservationStoreWriteOptions { readonly cache?: boolean; }
 export interface ObservationSnapshot extends ObservationSnapshotInput { readonly snapshotId: string; }
 export interface ObservationHistoryQuery { readonly cacheKey: string; readonly limit?: number; }
 type SqlRow = Record<string, unknown>;
@@ -89,9 +90,9 @@ const META_SQL = `CREATE TABLE store_meta (
 const SNAPSHOTS_SQL = `CREATE TABLE snapshots (
  snapshot_id TEXT PRIMARY KEY CHECK (length(snapshot_id) = 36),
  cache_key TEXT NOT NULL CHECK (length(cache_key) = 64 AND cache_key NOT GLOB '*[^0-9a-f]*'),
- operation TEXT NOT NULL CHECK (operation IN ('TOKEN_SCREENER', 'FLOW_INTELLIGENCE', 'SMART_MONEY_NETFLOW')),
+ operation TEXT NOT NULL CHECK (operation IN ('TOKEN_SCREENER', 'FLOW_INTELLIGENCE', 'SMART_MONEY_NETFLOW', 'TOKEN_OHLCV')),
  asset TEXT NOT NULL CHECK (asset IN ('BASE_PAIR', 'USDC', 'WETH')),
- timeframe TEXT NOT NULL CHECK (timeframe = '1h'),
+ timeframe TEXT NOT NULL CHECK (((operation = 'TOKEN_OHLCV' AND asset = 'USDC' AND timeframe = '1m') OR (operation <> 'TOKEN_OHLCV' AND timeframe = '1h'))),
  page_bound INTEGER NOT NULL CHECK (typeof(page_bound) = 'integer' AND page_bound BETWEEN 1 AND 20),
  retry_bound INTEGER NOT NULL CHECK (typeof(retry_bound) = 'integer' AND retry_bound BETWEEN 0 AND 2),
  source TEXT NOT NULL CHECK (source IN ('nansen', 'synthetic')),
@@ -112,7 +113,7 @@ const SNAPSHOTS_SQL = `CREATE TABLE snapshots (
  signal_id TEXT PRIMARY KEY CHECK (length(signal_id) = 36),
  snapshot_id TEXT NOT NULL REFERENCES snapshots(snapshot_id) ON DELETE CASCADE,
  provider TEXT NOT NULL CHECK (provider IN ('nansen', 'synthetic')),
- endpoint TEXT NOT NULL CHECK (endpoint IN ('TOKEN_SCREENER', 'FLOW_INTELLIGENCE', 'SMART_MONEY_NETFLOW')),
+ endpoint TEXT NOT NULL CHECK (endpoint IN ('TOKEN_SCREENER', 'FLOW_INTELLIGENCE', 'SMART_MONEY_NETFLOW', 'TOKEN_OHLCV')),
  chain_id INTEGER NOT NULL CHECK (chain_id = 8453),
  asset TEXT NOT NULL CHECK (asset IN ('USDC', 'WETH')),
  metric TEXT NOT NULL CHECK (length(metric) BETWEEN 1 AND 80),
@@ -186,7 +187,7 @@ function clockMs(clock: () => Date): number {
   if (!(date instanceof Date) || !Number.isSafeInteger(date.getTime()) || date.getTime() < 0) throw new ObservationStoreError('INVALID_INPUT');
   return date.getTime();
 }
-function normalizeSql(sql: string): string { return sql.replace(/\s+/gu, '').toLowerCase(); }
+function normalizeSql(sql: string): string { return sql.replaceAll(String.fromCharCode(32), '').replaceAll(String.fromCharCode(10), '').replaceAll(String.fromCharCode(13), '').replaceAll(String.fromCharCode(34), '').toLowerCase(); }
 function configure(db: DatabaseSync): void {
   db.exec('PRAGMA foreign_keys = ON');
   db.exec('PRAGMA busy_timeout = 5000');
@@ -213,7 +214,7 @@ function assertSchema(db: DatabaseSync, config: StoreConfig): void {
     if (columns.length !== schema?.columns.length || columns.some((column, j) => column !== schema?.columns[j])) throw new ObservationStoreError('DATABASE_CORRUPT');
   }
   const meta = db.prepare('SELECT schema_version, store_id, max_observation_rows, max_cache_entries, retention_ms FROM store_meta WHERE singleton = 1').get() as SqlRow | undefined;
-  if (!meta || meta.schema_version !== 1 || meta.store_id !== config.storeId || meta.max_observation_rows !== config.maxObservationRows || meta.max_cache_entries !== config.maxCacheEntries || meta.retention_ms !== config.retentionMs) {
+  if (!meta || meta.schema_version !== OBSERVATION_STORE_SCHEMA_VERSION || meta.store_id !== config.storeId || meta.max_observation_rows !== config.maxObservationRows || meta.max_cache_entries !== config.maxCacheEntries || meta.retention_ms !== config.retentionMs) {
     throw new ObservationStoreError('CONFIGURATION_MISMATCH');
   }
   const count = db.prepare('SELECT COUNT(*) AS count FROM store_meta').get() as SqlRow;
@@ -247,7 +248,74 @@ function transaction<T>(db: DatabaseSync, action: () => T): T {
     if (error instanceof ObservationStoreError) throw error;
     throw new ObservationStoreError('DATABASE_FAILURE');
   }
-}function validatePageReferences(value: unknown): readonly StoredPageReference[] {
+}
+const SNAPSHOTS_V1_SQL = SNAPSHOTS_SQL
+  .replace(", 'TOKEN_OHLCV'", '')
+  .replace("CHECK (((operation = 'TOKEN_OHLCV' AND asset = 'USDC' AND timeframe = '1m') OR (operation <> 'TOKEN_OHLCV' AND timeframe = '1h')))", "CHECK (timeframe = '1h')");
+const OBSERVATIONS_V1_SQL = OBSERVATIONS_SQL.replace(", 'TOKEN_OHLCV'", '');
+
+function assertObservationStoreV1Schema(db: DatabaseSync, config: StoreConfig): void {
+  const rows = db.prepare("SELECT type, name, sql FROM sqlite_master WHERE type IN ('table','view','trigger') AND name NOT LIKE 'sqlite_%' ORDER BY name").all() as SqlRow[];
+  const expected: Record<string, string> = {
+    cache_entries: CACHE_SQL, observations: OBSERVATIONS_V1_SQL, snapshots: SNAPSHOTS_V1_SQL, store_meta: META_SQL,
+  };
+  const names = Object.keys(expected).sort();
+  if (rows.length !== names.length) throw new ObservationStoreError('DATABASE_CORRUPT');
+  for (const [i, name] of names.entries()) {
+    const row = rows[i];
+    if (row?.type !== 'table' || row.name !== name || typeof row.sql !== 'string' ||
+        normalizeSql(row.sql) !== normalizeSql(expected[name] ?? '')) throw new ObservationStoreError('DATABASE_CORRUPT');
+    const columns = (db.prepare('PRAGMA table_info(' + name + ')').all() as SqlRow[]).map((column) => column.name);
+    const expectedColumns = TABLES[name]?.columns;
+    if (!expectedColumns || columns.length !== expectedColumns.length || columns.some((column, j) => column !== expectedColumns[j])) {
+      throw new ObservationStoreError('DATABASE_CORRUPT');
+    }
+  }
+  const meta = db.prepare('SELECT schema_version, store_id, max_observation_rows, max_cache_entries, retention_ms FROM store_meta WHERE singleton = 1').get() as SqlRow | undefined;
+  if (!meta || meta.schema_version !== 1 || meta.store_id !== config.storeId ||
+      meta.max_observation_rows !== config.maxObservationRows || meta.max_cache_entries !== config.maxCacheEntries ||
+      meta.retention_ms !== config.retentionMs) throw new ObservationStoreError('CONFIGURATION_MISMATCH');
+}
+
+function migrateObservationStoreV1(db: DatabaseSync, config: StoreConfig): void {
+  const version = db.prepare('PRAGMA user_version').get() as SqlRow | undefined;
+  if (version?.user_version !== 1) {
+    if (version?.user_version === OBSERVATION_STORE_SCHEMA_VERSION) return;
+    throw new ObservationStoreError('UNSUPPORTED_SCHEMA_VERSION');
+  }
+  assertIntegrity(db);
+  db.exec('PRAGMA foreign_keys = OFF');
+  try {
+    transaction(db, () => {
+      const current = db.prepare('PRAGMA user_version').get() as SqlRow | undefined;
+      if (current?.user_version !== 1) throw new ObservationStoreError('UNSUPPORTED_SCHEMA_VERSION');
+      assertObservationStoreV1Schema(db, config);
+      const snapshotsBefore = Number((db.prepare('SELECT COUNT(*) AS count FROM snapshots').get() as SqlRow).count);
+      const observationsBefore = Number((db.prepare('SELECT COUNT(*) AS count FROM observations').get() as SqlRow).count);
+      const snapshotsV2 = SNAPSHOTS_SQL.replace('CREATE TABLE snapshots (', 'CREATE TABLE snapshots_v2 (');
+      const observationsV2 = OBSERVATIONS_SQL.replace('CREATE TABLE observations (', 'CREATE TABLE observations_v2 (');
+      if (snapshotsV2 === SNAPSHOTS_SQL || observationsV2 === OBSERVATIONS_SQL) throw new ObservationStoreError('DATABASE_FAILURE');
+      db.exec(snapshotsV2);
+      db.exec('INSERT INTO snapshots_v2 SELECT * FROM snapshots');
+      db.exec(observationsV2);
+      db.exec('INSERT INTO observations_v2 SELECT * FROM observations');
+      db.exec('DROP TABLE observations');
+      db.exec('DROP TABLE snapshots');
+      db.exec('ALTER TABLE snapshots_v2 RENAME TO snapshots');
+      db.exec('ALTER TABLE observations_v2 RENAME TO observations');
+      db.prepare('UPDATE store_meta SET schema_version = ? WHERE singleton = 1').run(OBSERVATION_STORE_SCHEMA_VERSION);
+      db.exec('PRAGMA user_version = ' + OBSERVATION_STORE_SCHEMA_VERSION);
+      const snapshotsAfter = Number((db.prepare('SELECT COUNT(*) AS count FROM snapshots').get() as SqlRow).count);
+      const observationsAfter = Number((db.prepare('SELECT COUNT(*) AS count FROM observations').get() as SqlRow).count);
+      if (snapshotsBefore !== snapshotsAfter || observationsBefore !== observationsAfter) throw new ObservationStoreError('DATABASE_CORRUPT');
+    });
+  } finally {
+    db.exec('PRAGMA foreign_keys = ON');
+  }
+  assertIntegrity(db);
+  assertSchema(db, config);
+}
+function validatePageReferences(value: unknown): readonly StoredPageReference[] {
   if (!Array.isArray(value) || value.length > MAX_PAGE_REFERENCES) throw new ObservationStoreError('INVALID_INPUT');
   const result: StoredPageReference[] = [];
   for (const item of value) {
@@ -295,7 +363,7 @@ function validateSnapshot(input: ObservationSnapshotInput): ObservationSnapshot 
     typeof snapshotId !== 'string' || !/^[0-9a-f-]{36}$/iu.test(snapshotId) ||
     typeof input.cacheKey !== 'string' || !HASH.test(input.cacheKey) ||
     typeof input.operation !== 'string' || !(ENDPOINTS as readonly string[]).includes(input.operation) ||
-    !['BASE_PAIR', 'USDC', 'WETH'].includes(String(input.asset)) || input.timeframe !== '1h' ||
+    !['BASE_PAIR', 'USDC', 'WETH'].includes(String(input.asset)) || (input.operation === 'TOKEN_OHLCV' ? input.asset !== 'USDC' || input.timeframe !== '1m' || input.pageBound !== 1 || input.retryBound !== 0 : input.timeframe !== '1h') ||
     !Number.isSafeInteger(input.pageBound) || Number(input.pageBound) < 1 || Number(input.pageBound) > 20 ||
     !Number.isSafeInteger(input.retryBound) || Number(input.retryBound) < 0 || Number(input.retryBound) > 2 ||
     (input.source !== 'nansen' && input.source !== 'synthetic') ||
@@ -312,15 +380,18 @@ function validateSnapshot(input: ObservationSnapshotInput): ObservationSnapshot 
     if (!parsed.success) throw new ObservationStoreError('INVALID_INPUT');
     const signal = parsed.data;
     if (input.completeness !== 'complete' && signal.quality === 'COMPLETE') throw new ObservationStoreError('INVALID_INPUT');
-    if (signal.endpoint !== endpoint || signal.provider !== input.source || signal.observedAt !== acquired.iso || signal.fetchedAt !== fetched.iso) {
+    const signalTimeValid = input.operation === 'TOKEN_OHLCV'
+      ? signal.asset === 'USDC' && signal.metric === 'price_usd' && signal.timeframe === '1m' && Date.parse(signal.observedAt) + 60_000 <= fetched.ms
+      : signal.observedAt === acquired.iso && (signal.timeframe === undefined || signal.timeframe === '1h');
+    if (signal.endpoint !== endpoint || signal.provider !== input.source || !signalTimeValid || signal.fetchedAt !== fetched.iso) {
       throw new ObservationStoreError('INVALID_INPUT');
     }
-    return Object.freeze(signal);
+    return Object.freeze({ ...signal, timeframe: input.timeframe as ObservationSnapshot['timeframe'] });
   });
   if (new Set(signals.map((signal) => signal.signalId)).size !== signals.length) throw new ObservationStoreError('INVALID_INPUT');
   return Object.freeze({
     snapshotId, cacheKey: input.cacheKey, operation: input.operation as NansenOperation,
-    asset: input.asset as ObservationSnapshot['asset'], timeframe: '1h', pageBound: Number(input.pageBound),
+    asset: input.asset as ObservationSnapshot['asset'], timeframe: input.timeframe as ObservationSnapshot['timeframe'], pageBound: Number(input.pageBound),
     retryBound: Number(input.retryBound), source: input.source, fetchedAt: fetched.iso, acquiredAt: acquired.iso,
     expiresAt: expires.iso, completeness: input.completeness as AdapterCompleteness, failure,
     pageReferences, unavailableFields, signals: Object.freeze(signals),
@@ -351,7 +422,7 @@ function snapshotFromRow(db: DatabaseSync, row: SqlRow): ObservationSnapshot {
   const signals = rows.map((r) => {
     const parsed = normalizedSignalSchema.safeParse({
       signalId: r.signal_id, provider: r.provider, endpoint: r.endpoint, chainId: r.chain_id,
-      asset: r.asset, metric: r.metric, observedAt: r.observed_at, fetchedAt: r.fetched_at,
+      asset: r.asset, metric: r.metric, observedAt: r.observed_at, fetchedAt: r.fetched_at, timeframe: row.timeframe,
       quality: r.quality, value: r.value, unit: r.unit, provenanceId: r.provenance_id,
     });
     if (!parsed.success) throw new ObservationStoreError('DATABASE_CORRUPT');
@@ -361,25 +432,33 @@ function snapshotFromRow(db: DatabaseSync, row: SqlRow): ObservationSnapshot {
   const unavailable = parseJson(row.unavailable_fields_json, validateUnavailable);
   return validateSnapshot({
     snapshotId: row.snapshot_id, cacheKey: row.cache_key, operation: row.operation as NansenOperation,
-    asset: row.asset as ObservationSnapshot['asset'], timeframe: row.timeframe as '1h',
+    asset: row.asset as ObservationSnapshot['asset'], timeframe: row.timeframe as ObservationSnapshot['timeframe'],
     pageBound: Number(row.page_bound), retryBound: Number(row.retry_bound), source: row.source as 'nansen' | 'synthetic',
     fetchedAt: row.fetched_at, acquiredAt: row.acquired_at, expiresAt: row.expires_at,
     completeness: row.completeness as AdapterCompleteness, failure, pageReferences: refs,
     unavailableFields: unavailable, signals,
   });
-}export class NansenObservationStore {
+}
+
+export class NansenObservationStore {
   private closed = false;
   constructor(private readonly db: DatabaseSync, private readonly config: StoreConfig) {}
 
-  writeSnapshot(input: ObservationSnapshotInput): ObservationSnapshot {
+  /** Set `cache: false` to append historical evidence without changing cache rows. */
+  writeSnapshot(input: ObservationSnapshotInput, options?: ObservationStoreWriteOptions): ObservationSnapshot {
     this.ensureOpen();
+    if (options !== undefined && (!isRecord(options) || !exactKeys(options, ['cache']) ||
+        (options.cache !== undefined && typeof options.cache !== 'boolean'))) throw new ObservationStoreError('INVALID_INPUT');
+    const updateCache = options?.cache ?? true;
     const snapshot = validateSnapshot(input);
     if (snapshot.signals.length > this.config.maxObservationRows) throw new ObservationStoreError('CAPACITY_EXCEEDED');
     const cachedAt = clockMs(this.config.clock);
     const retentionCutoff = cachedAt - this.config.retentionMs;
     return transaction(this.db, () => {
-      this.db.prepare('DELETE FROM cache_entries WHERE expires_at_ms <= ?').run(cachedAt);
-      this.db.prepare('DELETE FROM snapshots WHERE acquired_at_ms < ?').run(retentionCutoff);
+      if (updateCache) {
+        this.db.prepare('DELETE FROM cache_entries WHERE expires_at_ms <= ?').run(cachedAt);
+        this.db.prepare('DELETE FROM snapshots WHERE acquired_at_ms < ?').run(retentionCutoff);
+      }
       this.db.prepare(
         'INSERT INTO snapshots (snapshot_id, cache_key, operation, asset, timeframe, page_bound, retry_bound, source, fetched_at, acquired_at, fetched_at_ms, acquired_at_ms, expires_at, expires_at_ms, completeness, failure_code, failure_status, failure_ledger_code, page_references_json, unavailable_fields_json, observation_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       ).run(
@@ -397,18 +476,22 @@ function snapshotFromRow(db: DatabaseSync, row: SqlRow): ObservationSnapshot {
         insert.run(signal.signalId, snapshot.snapshotId, signal.provider, signal.endpoint, signal.chainId, signal.asset,
           signal.metric, signal.observedAt, signal.fetchedAt, signal.quality, signal.value, signal.unit, signal.provenanceId);
       }
-      this.db.prepare(
-        'INSERT INTO cache_entries (cache_key, snapshot_id, cached_at_ms, expires_at_ms) VALUES (?, ?, ?, ?) ON CONFLICT(cache_key) DO UPDATE SET snapshot_id = excluded.snapshot_id, cached_at_ms = excluded.cached_at_ms, expires_at_ms = excluded.expires_at_ms',
-      ).run(snapshot.cacheKey, snapshot.snapshotId, cachedAt, Date.parse(snapshot.expiresAt));
+      if (updateCache) {
+        this.db.prepare(
+          'INSERT INTO cache_entries (cache_key, snapshot_id, cached_at_ms, expires_at_ms) VALUES (?, ?, ?, ?) ON CONFLICT(cache_key) DO UPDATE SET snapshot_id = excluded.snapshot_id, cached_at_ms = excluded.cached_at_ms, expires_at_ms = excluded.expires_at_ms',
+        ).run(snapshot.cacheKey, snapshot.snapshotId, cachedAt, Date.parse(snapshot.expiresAt));
+        const count = (sql: string) => Number((this.db.prepare(sql).get() as SqlRow).count);
+        const extraCache = count('SELECT COUNT(*) AS count FROM cache_entries') - this.config.maxCacheEntries;
+        if (extraCache > 0) this.db.prepare(
+          'DELETE FROM cache_entries WHERE cache_key IN (SELECT cache_key FROM cache_entries ORDER BY cached_at_ms, cache_key LIMIT ?)',
+        ).run(extraCache);
+      }
       const count = (sql: string) => Number((this.db.prepare(sql).get() as SqlRow).count);
-      const extraCache = count('SELECT COUNT(*) AS count FROM cache_entries') - this.config.maxCacheEntries;
-      if (extraCache > 0) this.db.prepare(
-        'DELETE FROM cache_entries WHERE cache_key IN (SELECT cache_key FROM cache_entries ORDER BY cached_at_ms, cache_key LIMIT ?)',
-      ).run(extraCache);
       let rows = count('SELECT COUNT(*) AS count FROM observations');
       while (rows > this.config.maxObservationRows) {
-        const oldest = this.db.prepare(
-          'SELECT snapshot_id, observation_count FROM snapshots WHERE snapshot_id <> ? ORDER BY acquired_at_ms, snapshot_id LIMIT 1',
+        const oldest = this.db.prepare(updateCache
+          ? 'SELECT snapshot_id, observation_count FROM snapshots WHERE snapshot_id <> ? ORDER BY acquired_at_ms, snapshot_id LIMIT 1'
+          : 'SELECT s.snapshot_id, s.observation_count FROM snapshots s LEFT JOIN cache_entries c ON c.snapshot_id = s.snapshot_id WHERE s.snapshot_id <> ? AND c.snapshot_id IS NULL ORDER BY s.acquired_at_ms, s.snapshot_id LIMIT 1',
         ).get(snapshot.snapshotId) as SqlRow | undefined;
         if (!oldest || typeof oldest.snapshot_id !== 'string') throw new ObservationStoreError('CAPACITY_EXCEEDED');
         rows -= Number(oldest.observation_count);
@@ -416,7 +499,10 @@ function snapshotFromRow(db: DatabaseSync, row: SqlRow): ObservationSnapshot {
       }
       let snapshots = count('SELECT COUNT(*) AS count FROM snapshots');
       while (snapshots > MAX_SNAPSHOT_ROWS) {
-        const oldestSnapshot = this.db.prepare('SELECT snapshot_id FROM snapshots WHERE snapshot_id <> ? ORDER BY acquired_at_ms, snapshot_id LIMIT 1').get(snapshot.snapshotId) as SqlRow | undefined;
+        const oldestSnapshot = this.db.prepare(updateCache
+          ? 'SELECT snapshot_id FROM snapshots WHERE snapshot_id <> ? ORDER BY acquired_at_ms, snapshot_id LIMIT 1'
+          : 'SELECT s.snapshot_id FROM snapshots s LEFT JOIN cache_entries c ON c.snapshot_id = s.snapshot_id WHERE s.snapshot_id <> ? AND c.snapshot_id IS NULL ORDER BY s.acquired_at_ms, s.snapshot_id LIMIT 1',
+        ).get(snapshot.snapshotId) as SqlRow | undefined;
         if (!oldestSnapshot || typeof oldestSnapshot.snapshot_id !== 'string') throw new ObservationStoreError('CAPACITY_EXCEEDED');
         this.db.prepare('DELETE FROM snapshots WHERE snapshot_id = ?').run(oldestSnapshot.snapshot_id);
         snapshots -= 1;
@@ -444,6 +530,16 @@ function snapshotFromRow(db: DatabaseSync, row: SqlRow): ObservationSnapshot {
       const row = this.db.prepare(
         "SELECT * FROM snapshots WHERE cache_key = ? AND observation_count > 0 AND failure_code IS NULL AND completeness = 'complete' ORDER BY acquired_at_ms DESC, snapshot_id DESC LIMIT 1",
       ).get(cacheKey) as SqlRow | undefined;
+      return row ? snapshotFromRow(this.db, row) : null;
+    });
+  }
+
+  /** Read the newest stored attempt for one exact managed query identity, including incomplete results. */
+  getLatestSnapshotByCacheKey(cacheKey: string): ObservationSnapshot | null {
+    this.ensureOpen();
+    if (!HASH.test(cacheKey)) throw new ObservationStoreError('INVALID_INPUT');
+    return transaction(this.db, () => {
+      const row = this.db.prepare('SELECT * FROM snapshots WHERE cache_key = ? ORDER BY acquired_at_ms DESC, snapshot_id DESC LIMIT 1').get(cacheKey) as SqlRow | undefined;
       return row ? snapshotFromRow(this.db, row) : null;
     });
   }
@@ -531,9 +627,9 @@ export function initializeNansenObservationStore(options: ObservationStoreOption
     if ((db.prepare('PRAGMA journal_mode = WAL').get() as SqlRow | undefined)?.journal_mode !== 'wal') throw new ObservationStoreError('DATABASE_FAILURE');
     transaction(db, () => {
       db?.exec(META_SQL); db?.exec(SNAPSHOTS_SQL); db?.exec(OBSERVATIONS_SQL); db?.exec(CACHE_SQL);
-      db?.exec('PRAGMA user_version = 1');
-      db?.prepare('INSERT INTO store_meta (singleton, schema_version, store_id, max_observation_rows, max_cache_entries, retention_ms) VALUES (1, 1, ?, ?, ?, ?)')
-        .run(config.storeId, config.maxObservationRows, config.maxCacheEntries, config.retentionMs);
+      db?.exec('PRAGMA user_version = ' + OBSERVATION_STORE_SCHEMA_VERSION);
+      db?.prepare('INSERT INTO store_meta (singleton, schema_version, store_id, max_observation_rows, max_cache_entries, retention_ms) VALUES (1, ?, ?, ?, ?, ?)')
+        .run(OBSERVATION_STORE_SCHEMA_VERSION, config.storeId, config.maxObservationRows, config.maxCacheEntries, config.retentionMs);
     });
     assertIntegrity(db); assertSchema(db, config);
     return new NansenObservationStore(db, config);
@@ -547,7 +643,7 @@ export function initializeNansenObservationStore(options: ObservationStoreOption
 export function openNansenObservationStore(options: ObservationStoreOptions): NansenObservationStore {
   const config = validateConfig(options);
   const db = openExisting(config.databasePath);
-  try { assertIntegrity(db); assertSchema(db, config); return new NansenObservationStore(db, config); }
+  try { migrateObservationStoreV1(db, config); assertIntegrity(db); assertSchema(db, config); return new NansenObservationStore(db, config); }
   catch (error) {
     try { db.close(); } catch { /* Preserve state on fail-closed open. */ }
     if (error instanceof ObservationStoreError) throw error;

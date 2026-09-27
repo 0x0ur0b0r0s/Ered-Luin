@@ -30,6 +30,7 @@ import {
   type NansenClient,
   type NansenManagedQuery,
   type SmartMoneyNetflowToken,
+  type TokenOhlcvAdapterResult,
   type TokenScreenerToken,
 } from '@ered-luin/nansen';
 import type { CreatePaperAccountInput } from './paper-store.js';
@@ -139,6 +140,8 @@ function replayClient(config: ScenarioConfig): NansenClient {
   return {
     tokenScreener: async () => adapterResult('TOKEN_SCREENER', [token('USDC'), token('WETH')], config.screenerCompleteness),
     flowIntelligence: async () => adapterResult('FLOW_INTELLIGENCE', [flowRow()]),
+    tokenOhlcv: async (): Promise<TokenOhlcvAdapterResult> => Object.freeze({ operation: 'TOKEN_OHLCV', candle: null,
+      completeness: 'complete', pageReferences: Object.freeze([]), failure: null }),
     smartMoneyNetflow: async () => adapterResult('SMART_MONEY_NETFLOW', [
       netflowRow('USDC', 500),
       ...(config.wethNetflowUsd === null ? [] : [netflowRow('WETH', config.wethNetflowUsd)]),

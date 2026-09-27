@@ -3,8 +3,8 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { normalizedSignalSchema, type D2Runtime, type ExecutionTransactionEnvelope } from '@ered-luin/contracts';
-import type { ObservationSnapshot } from '@ered-luin/nansen';
+import { normalizedSignalSchema, type D2EvidenceResponse, type D2Runtime, type ExecutionTransactionEnvelope } from '@ered-luin/contracts';
+import { BASE_USDC_OHLCV_PRICE_CACHE_KEY, BASE_USDC_PRICE_CACHE_KEY, WETH_RESEARCH_CACHE_KEYS, type ObservationSnapshot } from '@ered-luin/nansen';
 import { initializeD2AuditStore, openD2AuditStore } from './d2-audit-store.js';
 import { createD2ProductionService } from './d2-production.js';
 import { createApiApp } from './api.js';
@@ -22,7 +22,7 @@ const SESSION_ID = '00000000-0000-4000-8000-000000000321';
 const RUNTIME: D2Runtime = {
   service: 'ered-luin-api', status: 'ok', appMode: 'PRODUCTION_READ_ONLY',
   paidNansenCallsEnabled: false, activeNansenCreditBudget: 0, liveExecutionEnabled: false,
-  executionControls: { operatorAuthConfigured: true, signingEnabled: false, submissionEnabled: false, reviewedMode: false },
+  executionControls: { operatorAuthConfigured: true, signingEnabled: false, submissionEnabled: false, reviewedMode: false, browserWalletEnabled: false },
   nansenObservationStore: 'configured', productionEvaluation: 'configured',
   baseRpc: 'disabled', g3cStatusReader: 'configured', rpcRunBudget: null,
 };
@@ -81,7 +81,11 @@ function createHarness(initialFlow = '1000000', staleFlow = false, now: () => Da
   let flow = initialFlow;
   let stale = staleFlow;
   const calls = { sources: [] as string[], quoteAmounts: [] as string[], quoteTimes: [] as string[], simulation: 0, recovery: 0 };
-  const observations = {
+  let splitSnapshotsByCacheKey: Map<string, ObservationSnapshot> | null = null;
+  const observations: {
+    getLatestSnapshots(source: 'nansen' | 'synthetic'): readonly ObservationSnapshot[];
+    getLatestSnapshotByCacheKey?: (cacheKey: string) => ObservationSnapshot | null;
+  } = {
     getLatestSnapshots(source: 'nansen' | 'synthetic') {
       calls.sources.push(source);
       return source === 'nansen' ? snapshots(flow, stale) : [];
@@ -137,6 +141,73 @@ function createHarness(initialFlow = '1000000', staleFlow = false, now: () => Da
   return {
     app, store, execution, g3c, auditPath, dir, calls, operatorHeaders,
     setEvidence(nextFlow: string, isStale = false) { flow = nextFlow; stale = isStale; },
+    useSplitEvidence(
+      usdcState: 'fresh' | 'missing' | 'stale' | 'wrong' | 'duplicate' = 'fresh',
+      duplicateUsdc = false,
+      pairedState: 'fresh' | 'stale' | 'incomplete' | 'wrong' | 'duplicate' | 'missing-weth' = 'fresh',
+    ) {
+      const [pair, netflow] = snapshots(flow, stale);
+      const wethPrice = pair!.signals.filter((signal) => signal.asset === 'WETH' && signal.metric === 'price_usd');
+      const usdcPrice = pair!.signals.find((signal) => signal.asset === 'USDC' && signal.metric === 'price_usd')!;
+      const oldFetchedAt = new Date(NOW.getTime() - 60 * 60_000).toISOString();
+      const pairedFetchedAt = pairedState === 'stale' ? oldFetchedAt : pair!.fetchedAt;
+      const pairedAcquiredAt = pairedState === 'stale' ? new Date(Date.parse(oldFetchedAt) + 1_000).toISOString() : pair!.acquiredAt;
+      const pairedUsdcPrice = pairedState === 'stale'
+        ? { ...usdcPrice, fetchedAt: pairedFetchedAt, observedAt: pairedAcquiredAt }
+        : pairedState === 'incomplete' ? { ...usdcPrice, quality: 'PARTIAL' as const, value: null } : usdcPrice;
+      const pairedWethPrice = pairedState === 'missing-weth' ? [] : pairedState === 'stale'
+        ? wethPrice.map((signal) => ({ ...signal, fetchedAt: pairedFetchedAt, observedAt: pairedAcquiredAt }))
+        : wethPrice;
+      const pairedSignals = [
+        ...pairedWethPrice,
+        pairedUsdcPrice,
+        ...(pairedState === 'duplicate' ? [{ ...pairedUsdcPrice, signalId: '00000000-0000-4000-8000-000000000105' }] : []),
+      ];
+      const splitPair: ObservationSnapshot = {
+        ...pair!, cacheKey: pairedState === 'wrong' ? 'f'.repeat(64) : WETH_RESEARCH_CACHE_KEYS.TOKEN_SCREENER,
+        fetchedAt: pairedFetchedAt, acquiredAt: pairedAcquiredAt,
+        expiresAt: pairedState === 'stale' ? new Date(NOW.getTime() + 60_000).toISOString() : pair!.expiresAt,
+        completeness: pairedState === 'incomplete' ? 'incomplete' : pair!.completeness,
+        signals: pairedSignals,
+      };
+      const splitUsdcSignal = usdcState === 'stale'
+        ? { ...usdcPrice, fetchedAt: oldFetchedAt }
+        : usdcPrice;
+      const splitUsdc: ObservationSnapshot = {
+        ...pair!, snapshotId: '00000000-0000-4000-8000-000000000203', cacheKey: BASE_USDC_PRICE_CACHE_KEY,
+        asset: usdcState === 'wrong' ? 'BASE_PAIR' : 'USDC',
+        fetchedAt: usdcState === 'stale' ? oldFetchedAt : pair!.fetchedAt,
+        expiresAt: pair!.expiresAt,
+        signals: usdcState === 'duplicate'
+          ? [splitUsdcSignal, { ...splitUsdcSignal, signalId: '00000000-0000-4000-8000-000000000104' }]
+          : duplicateUsdc ? [splitUsdcSignal, { ...splitUsdcSignal, signalId: '00000000-0000-4000-8000-000000000104' }] : [splitUsdcSignal],
+      };
+      splitSnapshotsByCacheKey = new Map([[WETH_RESEARCH_CACHE_KEYS.TOKEN_SCREENER, splitPair]]);
+      if (usdcState !== 'missing') splitSnapshotsByCacheKey.set(BASE_USDC_PRICE_CACHE_KEY, splitUsdc);
+      splitSnapshotsByCacheKey.set('netflow', netflow!);
+      observations.getLatestSnapshotByCacheKey = (cacheKey) => splitSnapshotsByCacheKey?.get(cacheKey) ?? null;
+    },
+    useOhlcv(state: 'fresh' | 'stale' | 'invalid' = 'fresh') {
+      const observedAt = new Date(NOW.getTime() - (state === 'stale' ? 20 : 2) * 60_000).toISOString();
+      const fetchedAt = new Date(NOW.getTime() - 1_000).toISOString();
+      const signal = normalizedSignalSchema.parse({
+        signalId: '00000000-0000-4000-8000-000000000305', provider: 'nansen', endpoint: 'TOKEN_OHLCV',
+        chainId: 8453, asset: 'USDC', metric: 'price_usd', timeframe: '1m', observedAt, fetchedAt,
+        quality: state === 'invalid' ? 'PARTIAL' : 'COMPLETE', value: state === 'invalid' ? null : '1000100',
+        unit: 'usd_micros', provenanceId: 'offline-test-only:synthetic-ohlcv',
+      });
+      const snapshot: ObservationSnapshot = {
+        snapshotId: '00000000-0000-4000-8000-000000000305', cacheKey: BASE_USDC_OHLCV_PRICE_CACHE_KEY,
+        operation: 'TOKEN_OHLCV', asset: 'USDC', timeframe: '1m', pageBound: 1, retryBound: 0, source: 'nansen',
+        fetchedAt, acquiredAt: NOW.toISOString(), expiresAt: new Date(NOW.getTime() + 10 * 60_000).toISOString(),
+        completeness: state === 'invalid' ? 'incomplete' : 'complete', failure: null,
+        pageReferences: [{ attemptId: 'synthetic-d2v-attempt', status: 200, providerRequestId: 'synthetic-d2v',
+          chargedCredits: 0, page: 1, received: true, retry: 0 }], unavailableFields: [], signals: [signal],
+      };
+      splitSnapshotsByCacheKey ??= new Map();
+      splitSnapshotsByCacheKey.set(BASE_USDC_OHLCV_PRICE_CACHE_KEY, snapshot);
+      observations.getLatestSnapshotByCacheKey = (cacheKey) => splitSnapshotsByCacheKey?.get(cacheKey) ?? null;
+    },
     async close(retainFiles = false) {
       await app.close();
       if (!retainFiles) rmSync(dir, { recursive: true, force: true });
@@ -149,9 +220,13 @@ async function createProposal(harness: ReturnType<typeof createHarness>, request
     method: 'POST', url: '/v1/production/proposals', payload: { walletAddress: WALLET, requestedUsdcMicros },
   });
   expect(response.statusCode).toBe(201);
-  return response.json() as { proposalId: string; intent: { intentId: string; amountIn: string }; evidence: { source: string; observationIds: string[]; batches: unknown[] } };
+  return response.json() as { proposalId: string; intent: { intentId: string; amountIn: string }; evidence: D2EvidenceResponse & { observationIds: string[] } };
 }
-async function evaluate(harness: ReturnType<typeof createHarness>, proposalId: string) {
+async function currentEvidence(harness: ReturnType<typeof createHarness>): Promise<D2EvidenceResponse> {
+  const response = await harness.app.inject({ headers: harness.operatorHeaders, method: 'GET', url: '/v1/production/evidence' });
+  expect(response.statusCode).toBe(200);
+  return response.json() as D2EvidenceResponse;
+}async function evaluate(harness: ReturnType<typeof createHarness>, proposalId: string) {
   const response = await harness.app.inject({ headers: harness.operatorHeaders,
     method: 'POST', url: '/v1/production/evaluations', payload: { proposalId, sessionId: SESSION_ID },
   });
@@ -161,6 +236,75 @@ async function evaluate(harness: ReturnType<typeof createHarness>, proposalId: s
 }
 
 describe('D2 production-read-only API integration', () => {
+  it('composes separate fresh USDC-only and WETH-pair snapshots for policy evidence', async () => {
+    const h = createHarness();
+    h.useSplitEvidence();
+    try {
+      const proposal = await createProposal(h, '4000000');
+      expect(proposal.evidence.observations.map((signal) => signal.asset).sort()).toEqual(['USDC', 'WETH', 'WETH']);
+      expect(proposal.evidence.batches).toHaveLength(3);
+      expect(proposal.evidence.batches.map((batch) => batch.operation)).toEqual(['TOKEN_SCREENER', 'TOKEN_SCREENER', 'SMART_MONEY_NETFLOW']);
+      expect((await evaluate(h, proposal.proposalId)).decision.status).toBe('ALLOW');
+    } finally { await h.close(); }
+  });
+
+  it.each([
+    ['missing', false],
+    ['stale', false],
+    ['wrong', false],
+    ['duplicate', false],
+  ] as const)('uses the fresh paired USDC price when the separate source is %s', async (state, duplicate) => {
+    const h = createHarness();
+    h.useSplitEvidence(state, duplicate);
+    try {
+      const evidence = await currentEvidence(h);
+      expect(evidence.freshness).toBe('fresh');
+      expect(evidence.observations.map((signal) => signal.asset).sort()).toEqual(['USDC', 'WETH', 'WETH']);
+      expect(evidence.batches).toHaveLength(2);
+      expect(evidence.batches[0]?.observationIds).toHaveLength(2);
+      const proposal = await createProposal(h, '4000000');
+      expect((await evaluate(h, proposal.proposalId)).decision.status).toBe('ALLOW');
+    } finally { await h.close(); }
+  });
+
+  it.each([
+    ['stale', 'stale'],
+    ['incomplete', 'incomplete'],
+    ['wrong', 'missing'],
+    ['duplicate', 'missing'],
+  ] as const)('rejects %s paired USDC price evidence', async (pairedState, expectedFreshness) => {
+    const h = createHarness();
+    h.useSplitEvidence('missing', false, pairedState);
+    try {
+      const evidence = await currentEvidence(h);
+      expect(evidence.freshness).toBe(expectedFreshness);
+      const proposal = await createProposal(h, '4000000');
+      const result = await evaluate(h, proposal.proposalId);
+      expect(result.decision.status).toBe('REQUIRE_REVIEW');
+      expect(result.decision.approvedAmountIn).toBeNull();
+    } finally { await h.close(); }
+  });
+
+  it('prefers a usable separate USDC price when the paired signal is incomplete', async () => {
+    const h = createHarness();
+    h.useSplitEvidence('fresh', false, 'incomplete');
+    try {
+      const evidence = await currentEvidence(h);
+      expect(evidence.observations.find((signal) => signal.asset === 'USDC')?.signalId).toBe('00000000-0000-4000-8000-000000000101');
+      expect(evidence.batches).toHaveLength(3);
+      expect(evidence.freshness).toBe('incomplete');
+    } finally { await h.close(); }
+  });
+  it('preserves a valid paired USDC price even when the same snapshot lacks WETH', async () => {
+    const h = createHarness();
+    h.useSplitEvidence('missing', false, 'missing-weth');
+    try {
+      const evidence = await currentEvidence(h);
+      expect(evidence.observations.map((signal) => signal.asset)).toContain('USDC');
+      expect(evidence.observations.some((signal) => signal.asset === 'WETH' && signal.metric === 'price_usd')).toBe(false);
+      expect(evidence.freshness).toBe('missing');
+    } finally { await h.close(); }
+  });
   it('keeps Nansen provenance and changes G2 decision when stored flow evidence changes', async () => {
     const h = createHarness();
     try {
@@ -278,6 +422,42 @@ describe('D2 production-read-only API integration', () => {
       expect(h.calls.simulation).toBe(0);
       expect(h.calls.recovery).toBe(0);
       expect(h.store.getIntent(proposal.intent.intentId)).toBeNull();
+    } finally { await h.close(); }
+  });
+});
+
+describe('D2v OHLCV price evidence selection', () => {
+  it('prefers a fresh completed OHLCV candle and preserves its interval, resolution, and audit lineage', async () => {
+    const h = createHarness();
+    h.useSplitEvidence('fresh');
+    h.useOhlcv('fresh');
+    try {
+      const evidence = await currentEvidence(h);
+      const price = evidence.observations.find((signal) => signal.asset === 'USDC' && signal.metric === 'price_usd');
+      expect(price).toMatchObject({ endpoint: 'TOKEN_OHLCV', timeframe: '1m', observedAt: '2026-09-24T11:58:00.000Z', fetchedAt: '2026-09-24T11:59:59.000Z' });
+      expect(evidence.batches.find((batch) => batch.operation === 'TOKEN_OHLCV')).toMatchObject({
+        timeframe: '1m', pageBound: 1, retryBound: 0, status: 'fresh', ageMs: 120_000,
+      });
+      const proposal = await createProposal(h, '4000000');
+      const auditPrice = proposal.evidence.observations.find((signal) => signal.signalId === price?.signalId);
+      expect(auditPrice).toEqual(price);
+      const evaluated = await evaluate(h, proposal.proposalId);
+      expect(evaluated.evidenceBatches).toEqual(proposal.evidence.batches);
+      expect(evaluated.evidenceIds).toContain(price?.signalId);
+      expect(evaluated.decision.status).toBe('ALLOW');
+    } finally { await h.close(); }
+  });
+
+  it.each(['stale', 'invalid'] as const)('falls back deterministically from a %s preferred candle to fresh accepted screener evidence', async (state) => {
+    const h = createHarness();
+    h.useSplitEvidence('fresh');
+    h.useOhlcv(state);
+    try {
+      const evidence = await currentEvidence(h);
+      expect(evidence.observations.find((signal) => signal.asset === 'USDC' && signal.metric === 'price_usd')?.endpoint).toBe('TOKEN_SCREENER');
+      expect(evidence.freshness).toBe('fresh');
+      const proposal = await createProposal(h, '4000000');
+      expect((await evaluate(h, proposal.proposalId)).decision.status).toBe('ALLOW');
     } finally { await h.close(); }
   });
 });

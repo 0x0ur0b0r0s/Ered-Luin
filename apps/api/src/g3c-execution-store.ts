@@ -709,6 +709,15 @@ export class G3cExecutionStore {
   }
 
   prepareOperation(input: G3cWorkflowInput): G3cWorkflowWriteResult {
+    return this.prepareValidatedOperation(input, 'APPLICATION_SIGNER');
+  }
+
+  /** Create browser-wallet authority only after a complete transaction/evidence packet is validated. */
+  prepareBrowserOperation(input: G3cWorkflowInput): G3cWorkflowWriteResult {
+    return this.prepareValidatedOperation(input, 'BROWSER_WALLET');
+  }
+
+  private prepareValidatedOperation(input: G3cWorkflowInput, submissionMode: 'APPLICATION_SIGNER' | 'BROWSER_WALLET'): G3cWorkflowWriteResult {
     if (!input || typeof input.reason !== 'string' || !input.reason.trim() || input.reason.length > 240 ||
         !/^[0-9a-f-]{36}$/iu.test(input.executionId) || !/^[0-9a-f-]{36}$/iu.test(input.operationId)) fail('G3C_INVALID_INPUT');
     return this.execution.g3bTransaction((db, clock) => {
@@ -717,7 +726,7 @@ export class G3cExecutionStore {
       if (existingRow) {
         const existing = readWorkflow(db, input.operationId, this.trust);
         const same = existing.executionId === input.executionId && existing.sessionId === input.sessionId &&
-          existing.transactionDigest === workflowInputDigest(input);
+          existing.submissionMode === submissionMode && existing.transactionDigest === workflowInputDigest(input);
         if (!same) fail('G3C_OPERATION_ID_CONFLICT');
         return { workflow: existing, replayed: true };
       }
@@ -751,7 +760,8 @@ export class G3cExecutionStore {
       const workflow = g3cWorkflowSchema.parse({
         version: 1, executionId: input.executionId, intentId: parent.intentId, decisionId: parent.decisionId,
         reservationId: parent.reservationId, operationId: input.operationId, sessionId: session.sessionId,
-        kind: input.kind, status: 'AUTHORIZED', accountVersion: snapshot.accountVersion, accountSnapshot: snapshotEvidence, signingAccountSnapshot: null,
+        kind: input.kind, status: 'AUTHORIZED', submissionMode, browserStage: submissionMode === 'BROWSER_WALLET' ? 'READY' : null,
+        accountVersion: snapshot.accountVersion, accountSnapshot: snapshotEvidence, signingAccountSnapshot: null,
         quote: quoteEvidence, simulation: simulationEvidence, fee: feeEvidence,
         unsignedTransaction: g3bUnsignedTransactionSchema.parse(input.unsignedTransaction), transactionDigest,
         authorizationId: randomUUID(), signingClaimId: null, claimedAt: null,
@@ -766,7 +776,7 @@ export class G3cExecutionStore {
       writeSession(db, updatedSession);
       db.prepare('INSERT INTO execution_g3c_workflows (operation_id,execution_id,session_id,status,record_json,created_at,updated_at,revision) VALUES (?,?,?,?,?,?,?,?)')
         .run(workflow.operationId, workflow.executionId, workflow.sessionId, workflow.status, JSON.stringify(workflow), at, at, workflow.revision);
-      writeEvent(db, workflow.executionId, 'G3C_WORKFLOW_AUTHORIZED', input.reason, {
+      writeEvent(db, workflow.executionId, submissionMode === 'BROWSER_WALLET' ? 'D2_BROWSER_PENDING_CREATED' : 'G3C_WORKFLOW_AUTHORIZED', input.reason, {
         operationId: workflow.operationId, sessionId: workflow.sessionId, transactionDigest,
         accountVersion: workflow.accountVersion, reservedWorstCaseLossUsdcMicros: workflow.reservedWorstCaseLossUsdcMicros,
       }, at);
@@ -774,6 +784,165 @@ export class G3cExecutionStore {
     });
   }
 
+  prepareBrowserWallet(operationId: string, reason: string): G3cWorkflowWriteResult {
+    if (!reason.trim() || reason.length > 240) fail('G3C_INVALID_REASON');
+    return this.execution.g3bTransaction((db, clock) => {
+      const atDate = nowFrom(clock); const at = atDate.toISOString(); const nowMs = atDate.getTime();
+      const workflow = readWorkflow(db, operationId, this.trust);
+      if (workflow.submissionMode === 'BROWSER_WALLET' && workflow.browserStage === 'READY') return { workflow, replayed: true };
+      const parent = readParent(db, workflow.executionId); const session = readSession(db, workflow.sessionId, this.trust);
+      if (workflow.status !== 'AUTHORIZED' || workflow.submissionMode !== 'APPLICATION_SIGNER' || workflow.signingClaimId || workflow.signedBytesHex ||
+          parent.status !== 'RESERVED' || session.status !== 'ACTIVE' || killSwitchStopped(db) || Date.parse(workflow.intentExpiresAt) <= nowMs ||
+          !['ALLOW','RESIZE'].includes(parent.decision.status) || workflow.kind !== 'SWAP') fail('G3C_BROWSER_PREPARATION_INVALID');
+      reserveRow(db, parent);
+      for (const item of [workflow.accountSnapshot, workflow.quote, workflow.simulation, workflow.fee].filter(Boolean)) assertFreshG3cEvidence(item!, nowMs);
+      const next = nextWorkflow(workflow, { submissionMode: 'BROWSER_WALLET', browserStage: 'READY' }, at);
+      writeWorkflow(db, next);
+      writeEvent(db, workflow.executionId, 'D2_BROWSER_PENDING_CREATED', reason, {
+        operationId, sessionId: workflow.sessionId, transactionDigest: workflow.transactionDigest,
+        unsignedTransactionHash: g3bUnsignedTransactionHash(workflow.unsignedTransaction),
+      }, at);
+      return { workflow: next, replayed: false };
+    });
+  }
+
+  armBrowserWalletSubmission(operationId: string, currentAccountSnapshot: G3cEvidenceAttestation, reason: string): G3cWorkflowWriteResult {
+    if (!reason.trim() || reason.length > 240) fail('G3C_INVALID_REASON');
+    return this.execution.g3bTransaction((db, clock) => {
+      const atDate = nowFrom(clock); const at = atDate.toISOString(); const nowMs = atDate.getTime();
+      const workflow = readWorkflow(db, operationId, this.trust);
+      if (workflow.submissionMode !== 'BROWSER_WALLET' || workflow.browserStage !== 'READY' || workflow.status !== 'AUTHORIZED') fail('G3C_BROWSER_SEND_NOT_READY');
+      const parent = readParent(db, workflow.executionId); const session = readSession(db, workflow.sessionId, this.trust);
+      if (parent.status !== 'RESERVED' || session.status !== 'ACTIVE' || killSwitchStopped(db) ||
+          Date.parse(workflow.intentExpiresAt) <= nowMs || !['ALLOW','RESIZE'].includes(parent.decision.status)) fail('G3C_BROWSER_PREPARATION_INVALID');
+      reserveRow(db, parent);
+      const current = evidence(currentAccountSnapshot, this.trust, nowMs);
+      if (current.payload.kind !== 'ACCOUNT_SNAPSHOT' || current.payload.accountVersion !== workflow.accountVersion ||
+          !sameAccountState(accountPayload(current), accountPayload(workflow.accountSnapshot))) fail('G3C_ACCOUNT_VERSION_STALE');
+      for (const item of [workflow.accountSnapshot, workflow.quote, workflow.simulation, workflow.fee].filter(Boolean)) assertFreshG3cEvidence(item!, nowMs);
+      const next = nextWorkflow(workflow, { status: 'SUBMISSION_UNCERTAIN', browserStage: 'SUBMISSION_UNCERTAIN', submissionAttempts: 1 }, at);
+      writeWorkflow(db, next);
+      writeEvent(db, workflow.executionId, 'D2_BROWSER_SEND_ARMED', reason, {
+        operationId, sessionId: workflow.sessionId, walletAddress: workflow.unsignedTransaction.from,
+        chainId: workflow.unsignedTransaction.chainId, transactionDigest: workflow.transactionDigest,
+      }, at);
+      return { workflow: next, replayed: false };
+    });
+  }
+
+  recordBrowserTransaction(operationId: string, transactionHash: string, verification: 'MATCH' | 'NOT_FOUND' | 'CONFLICT', reason: string): G3cWorkflowWriteResult {
+    if (!reason.trim() || reason.length > 240 || !/^0x[0-9a-fA-F]{64}$/u.test(transactionHash)) fail('G3C_BROWSER_HASH_INVALID');
+    return this.execution.g3bTransaction((db, clock) => {
+      const at = nowFrom(clock).toISOString(); const workflow = readWorkflow(db, operationId, this.trust);
+      if (workflow.submissionMode !== 'BROWSER_WALLET' || !['SUBMISSION_UNCERTAIN','SUBMITTED','RECONCILIATION_REQUIRED'].includes(workflow.status)) fail('G3C_BROWSER_SUBMISSION_STATE_INVALID');
+      if (workflow.transactionHash && workflow.transactionHash.toLowerCase() !== transactionHash.toLowerCase()) fail('G3C_BROWSER_HASH_CONFLICT');
+      if (workflow.status === 'SUBMITTED' && workflow.transactionHash?.toLowerCase() === transactionHash.toLowerCase() && verification === 'MATCH') return { workflow, replayed: true };
+      const status = verification === 'MATCH' ? 'SUBMITTED' : verification === 'CONFLICT' ? 'RECONCILIATION_REQUIRED' : 'SUBMISSION_UNCERTAIN';
+      const browserStage = verification === 'MATCH' ? 'SUBMITTED' : verification === 'CONFLICT' ? 'RECONCILIATION_REQUIRED' : 'SUBMISSION_UNCERTAIN';
+      const next = nextWorkflow(workflow, { status, browserStage, transactionHash: transactionHash.toLowerCase() as Hex,
+        failureReason: verification === 'CONFLICT' ? 'BROWSER_TRANSACTION_MISMATCH' : null }, at);
+      writeWorkflow(db, next);
+      writeEvent(db, workflow.executionId, verification === 'CONFLICT' ? 'D2_BROWSER_RECONCILIATION_REQUIRED' : 'D2_BROWSER_SUBMISSION_OBSERVED', reason, {
+        operationId, transactionHash: transactionHash.toLowerCase(), verification,
+        expectedTransactionDigest: workflow.transactionDigest,
+      }, at);
+      return { workflow: next, replayed: false };
+    });
+  }
+
+  rejectBrowserWalletSubmission(operationId: string, reason: string): G3cWorkflowWriteResult {
+    if (!reason.trim() || reason.length > 240) fail('G3C_INVALID_REASON');
+    return this.execution.g3bTransaction((db, clock) => {
+      const at = nowFrom(clock).toISOString(); const workflow = readWorkflow(db, operationId, this.trust);
+      if (workflow.submissionMode !== 'BROWSER_WALLET' || !['SUBMISSION_UNCERTAIN','AUTHORIZED'].includes(workflow.status) ||
+          workflow.transactionHash !== null || !['SUBMISSION_UNCERTAIN','READY'].includes(workflow.browserStage ?? '')) fail('G3C_BROWSER_REJECTION_STATE_INVALID');
+      const session = readSession(db, workflow.sessionId, this.trust);
+      const remaining = BigInt(session.outstandingWorstCaseReservationsUsdcMicros) - BigInt(workflow.reservedWorstCaseLossUsdcMicros);
+      if (remaining < 0n) fail('G3C_SESSION_ACCOUNTING_CORRUPT');
+      const parent = readParent(db, workflow.executionId); reserveRow(db, parent);
+      const nextSessionRecord = nextSession(session, { outstandingWorstCaseReservationsUsdcMicros: remaining.toString() }, at);
+      const next = nextWorkflow(workflow, { status: 'CANCELLED', browserStage: 'REJECTED', failureReason: reason.includes('user rejection') ? 'WALLET_USER_REJECTED' : 'BROWSER_WALLET_CONTEXT_CHANGED' }, at);
+      writeSession(db, nextSessionRecord); writeWorkflow(db, next);
+      releaseParent(db, parent, 'D2_BROWSER_WALLET_USER_REJECTED', at);
+      writeEvent(db, workflow.executionId, 'D2_BROWSER_WALLET_REJECTED', reason, { operationId, sessionId: workflow.sessionId }, at);
+      return { workflow: next, replayed: false };
+    });
+  }
+
+  recordBrowserReceipt(operationId: string, receiptEvidence: G3cEvidenceAttestation,
+    settlementSnapshot?: G3cEvidenceAttestation | null, reason = 'Browser wallet receipt reconciliation'): G3cWorkflowWriteResult {
+    if (!reason.trim() || reason.length > 240) fail('G3C_INVALID_REASON');
+    return this.execution.g3bTransaction((db, clock) => {
+      const atDate = nowFrom(clock); const nowMs = atDate.getTime(); const at = atDate.toISOString();
+      const workflow = readWorkflow(db, operationId, this.trust);
+      if (workflow.submissionMode !== 'BROWSER_WALLET' || !workflow.transactionHash ||
+          !['SUBMISSION_UNCERTAIN','SUBMITTED','RECONCILIATION_REQUIRED','CONFIRMED','REVERTED'].includes(workflow.status)) fail('G3C_BROWSER_RECEIPT_STATE_INVALID');
+      const authenticReceipt = verifyG3cEvidenceAttestation(receiptEvidence, this.trust); const receipt = authenticReceipt.payload;
+      const parent = readParent(db, workflow.executionId);
+      if (receipt.kind !== 'RECEIPT' || receipt.executionId !== workflow.executionId || receipt.operationId !== operationId || receipt.chainId !== 8453 ||
+          receipt.transactionHash.toLowerCase() !== workflow.transactionHash.toLowerCase() ||
+          receipt.sender.toLowerCase() !== workflow.unsignedTransaction.from.toLowerCase() || receipt.nonce !== workflow.unsignedTransaction.nonce) fail('G3C_RECEIPT_MISMATCH');
+      if (workflow.status === 'CONFIRMED' || workflow.status === 'REVERTED') {
+        if (workflow.receipt && canonicalG3cEvidenceDigest(workflow.receipt) === canonicalG3cEvidenceDigest(authenticReceipt) &&
+            settlementSnapshot && workflow.settlementSnapshot && canonicalG3cEvidenceDigest(workflow.settlementSnapshot) === canonicalG3cEvidenceDigest(verifyG3cEvidenceAttestation(settlementSnapshot, this.trust))) return { workflow, replayed: true };
+        fail('G3C_RECEIPT_CONFLICT');
+      }
+      const receiptAttestation = evidence(authenticReceipt, this.trust, nowMs);
+      if (receipt.outcome === 'PENDING') {
+        const next = nextWorkflow(workflow, { status: 'SUBMITTED', browserStage: 'SUBMITTED', receipt: receiptAttestation }, at);
+        writeWorkflow(db, next); writeEvent(db, workflow.executionId, 'D2_BROWSER_RECEIPT_OBSERVED', reason, { operationId, outcome: receipt.outcome }, at);
+        return { workflow: next, replayed: false };
+      }
+      if (receipt.outcome === 'REPLACED' || receipt.outcome === 'CONFLICT') {
+        const next = nextWorkflow(workflow, { status: 'RECONCILIATION_REQUIRED', browserStage: 'RECONCILIATION_REQUIRED', receipt: receiptAttestation,
+          failureReason: receipt.outcome === 'REPLACED' ? 'TRANSACTION_REPLACED' : 'BROWSER_RECEIPT_CONFLICT' }, at);
+        writeWorkflow(db, next); writeEvent(db, workflow.executionId, 'D2_BROWSER_RECONCILIATION_REQUIRED', reason, { operationId, outcome: receipt.outcome }, at);
+        return { workflow: next, replayed: false };
+      }
+      if (receipt.finality !== 'finalized' || receipt.canonical !== true) {
+        const next = nextWorkflow(workflow, { status: 'RECONCILIATION_REQUIRED', browserStage: 'RECONCILIATION_REQUIRED', receipt: receiptAttestation,
+          failureReason: receipt.canonical === false ? 'RECEIPT_BLOCK_NOT_CANONICAL' : 'WAITING_FOR_FINALITY' }, at);
+        writeWorkflow(db, next); writeEvent(db, workflow.executionId, 'D2_BROWSER_RECONCILIATION_REQUIRED', reason, { operationId, finality: receipt.finality, canonical: receipt.canonical }, at);
+        return { workflow: next, replayed: false };
+      }
+      if (!settlementSnapshot) fail('G3C_SETTLEMENT_SNAPSHOT_REQUIRED');
+      const settledEvidence = snapshotForSettlement(settlementSnapshot, this.trust, nowMs, parent.walletAddress);
+      const settledSnapshot = accountPayload(settledEvidence); const session = readSession(db, workflow.sessionId, this.trust);
+      if (settledSnapshot.accountVersion !== session.latestAccountVersion + 1 || settledSnapshot.blockFinality !== 'finalized' ||
+          BigInt(settledSnapshot.blockNumber) < BigInt(receipt.blockNumber!)) fail('G3C_SETTLEMENT_SNAPSHOT_STALE');
+      const actualFees = BigInt(receipt.actualFeeUsdcMicros!); const actualGasUsed = BigInt(receipt.gasUsed!);
+      const actualEffectiveGasPrice = BigInt(receipt.effectiveGasPriceWei!); const actualL1Fee = BigInt(receipt.l1FeeWei!); const actualOperatorFee = BigInt(receipt.operatorFeeWei!);
+      if (actualGasUsed <= 0n || actualGasUsed > BigInt(workflow.unsignedTransaction.gasLimit) || actualEffectiveGasPrice <= 0n ||
+          actualEffectiveGasPrice > BigInt(workflow.unsignedTransaction.maxFeePerGasWei) || actualGasUsed * actualEffectiveGasPrice + actualL1Fee + actualOperatorFee <= 0n) fail('G3C_RECEIPT_FEE_COMPONENTS_INVALID');
+      const startValue = BigInt(accountPayload(workflow.accountSnapshot).walletValueUsdcMicros); const endValue = BigInt(settledSnapshot.walletValueUsdcMicros);
+      const lossBeforeFees = startValue > endValue ? startValue - endValue : 0n; const actualLoss = lossBeforeFees > actualFees ? lossBeforeFees - actualFees : 0n;
+      const remainingReserve = BigInt(session.outstandingWorstCaseReservationsUsdcMicros) - BigInt(workflow.reservedWorstCaseLossUsdcMicros);
+      if (remainingReserve < 0n) fail('G3C_SESSION_ACCOUNTING_CORRUPT');
+      const accountingBase = { ...session, realizedLossUsdcMicros: (BigInt(session.realizedLossUsdcMicros) + actualLoss).toString(),
+        realizedFeesUsdcMicros: (BigInt(session.realizedFeesUsdcMicros) + actualFees).toString(),
+        outstandingWorstCaseReservationsUsdcMicros: remainingReserve.toString() };
+      const accounting = accountSessionSnapshot(accountingBase, settledSnapshot, actualFees > G3C_CAPS.feeUsdcMicros);
+      const nextSessionRecord = nextSession(session, { status: accounting.status,
+        realizedLossUsdcMicros: accountingBase.realizedLossUsdcMicros, realizedFeesUsdcMicros: accountingBase.realizedFeesUsdcMicros,
+        unrealizedLossUsdcMicros: accounting.unrealizedLossUsdcMicros,
+        outstandingWorstCaseReservationsUsdcMicros: remainingReserve.toString(), markedExposureUsdcMicros: accounting.markedExposureUsdcMicros,
+        latestAccountVersion: settledSnapshot.accountVersion, latestSnapshotDigest: canonicalG3cEvidenceDigest(settledEvidence), latestSnapshot: settledEvidence }, at);
+      writeSession(db, nextSessionRecord);
+      const status = receipt.outcome === 'CONFIRMED' ? 'CONFIRMED' : 'REVERTED';
+      const next = nextWorkflow(workflow, { status, browserStage: status, receipt: receiptAttestation, settlementSnapshot: settledEvidence,
+        actualFeesUsdcMicros: actualFees.toString(), actualLossUsdcMicros: actualLoss.toString(),
+        failureReason: status === 'REVERTED' ? 'EXACT_TRANSACTION_REVERTED' : null }, at);
+      writeWorkflow(db, next);
+      if (workflow.kind === 'SWAP' || status === 'REVERTED') releaseParent(db, parent,
+        status === 'CONFIRMED' ? 'D2_BROWSER_FINALIZED_AND_RECONCILED' : 'D2_BROWSER_FINALIZED_REVERT_RECONCILED', at);
+      writeEvent(db, workflow.executionId, status === 'CONFIRMED' ? 'D2_BROWSER_SETTLEMENT_CONFIRMED' : 'D2_BROWSER_SETTLEMENT_REVERTED', reason,
+        { operationId, transactionHash: workflow.transactionHash, actualFeesUsdcMicros: actualFees.toString(), actualLossUsdcMicros: actualLoss.toString(),
+          blockNumber: receipt.blockNumber, blockHash: receipt.blockHash }, at);
+      if (accounting.status === 'STOPPED' && session.status !== 'STOPPED') writeEvent(db, workflow.executionId, 'G3C_SESSION_STOPPED',
+        accounting.stopReasons.join('|'), { sessionId: session.sessionId, projectedLossUsdcMicros: accounting.projectedLossUsdcMicros }, at);
+      return { workflow: next, replayed: false };
+    });
+  }
   claimForSigning(operationId: string, currentAccountSnapshot: G3cEvidenceAttestation, reason: string): G3cSigningRequest {
     if (typeof reason !== 'string' || !reason.trim() || reason.length > 240) fail('G3C_INVALID_REASON');
     const testAllowed = this.options.allowTestSigning === true && process.env.NODE_ENV === 'test' &&
@@ -786,7 +955,7 @@ export class G3cExecutionStore {
       const parent = readParent(db, workflow.executionId);
       const session = readSession(db, workflow.sessionId, this.trust);
       if (killSwitchStopped(db) || session.status !== 'ACTIVE') fail('KILL_SWITCH_STOPPED');
-      if (workflow.status !== 'AUTHORIZED' || parent.status !== 'RESERVED' ||
+      if (workflow.submissionMode !== 'APPLICATION_SIGNER' || workflow.status !== 'AUTHORIZED' || parent.status !== 'RESERVED' ||
           Date.parse(parent.intent.expiresAt) <= nowMs || workflow.intentExpiresAt !== parent.intent.expiresAt) fail('G3C_SIGNING_CLAIM_INVALID');
       const current = evidence(currentAccountSnapshot, this.trust, nowMs);
       if (current.payload.kind !== 'ACCOUNT_SNAPSHOT' || current.payload.accountVersion !== workflow.accountVersion ||
@@ -882,7 +1051,7 @@ export class G3cExecutionStore {
     return this.execution.g3bTransaction((db, clock) => {
       const atDate = nowFrom(clock); const nowMs = atDate.getTime(); const at = atDate.toISOString();
       const workflow = readWorkflow(db, operationId, this.trust);
-      if (!workflow.transactionHash || !workflow.signedBytesHex ||
+      if (workflow.submissionMode !== 'APPLICATION_SIGNER' || !workflow.transactionHash || !workflow.signedBytesHex ||
           !['SUBMISSION_UNCERTAIN','SUBMITTED','RECONCILIATION_REQUIRED','CONFIRMED','REVERTED'].includes(workflow.status)) fail('G3C_RECEIPT_STATE_INVALID');
       const authenticReceipt = verifyG3cEvidenceAttestation(receiptEvidence, this.trust);
       const receipt = authenticReceipt.payload;
@@ -1038,7 +1207,11 @@ export class G3cExecutionStore {
     });
   }
 
-  releaseAfterApprovalOnly(executionId: string, currentAccountSnapshot: G3cEvidenceAttestation, reason: string): void {
+  releaseAfterBrowserApproval(executionId: string, currentAccountSnapshot: G3cEvidenceAttestation, reason: string): void {
+    this.releaseAfterApprovalOnly(executionId, currentAccountSnapshot, reason, true);
+  }
+
+  releaseAfterApprovalOnly(executionId: string, currentAccountSnapshot: G3cEvidenceAttestation, reason: string, browserEarly = false): void {
     if (!reason.trim() || reason.length > 240) fail('G3C_INVALID_REASON');
     this.execution.g3bTransaction((db, clock) => {
       const atDate = nowFrom(clock); const at = atDate.toISOString(); const nowMs = atDate.getTime();
@@ -1048,8 +1221,9 @@ export class G3cExecutionStore {
         .all(executionId) as SqlRow[];
       const workflows = rows.map((row) => readWorkflow(db, String(row.operation_id), this.trust));
       const unresolved = workflows.filter((workflow) => !['CONFIRMED','REVERTED','CANCELLED'].includes(workflow.status));
+      const browserOnly = workflows.length > 0 && workflows.every((workflow) => workflow.submissionMode === 'BROWSER_WALLET');
       if (unresolved.length !== 0 || workflows.length === 0 || workflows.some((workflow) => workflow.kind !== 'APPROVAL' || workflow.status !== 'CONFIRMED') ||
-          Date.parse(parent.intent.expiresAt) > nowMs) fail('G3C_EXECUTION_NOT_RELEASABLE');
+          (Date.parse(parent.intent.expiresAt) > nowMs && !(browserEarly && browserOnly))) fail('G3C_EXECUTION_NOT_RELEASABLE');
       const session = readSession(db, workflows[workflows.length - 1]!.sessionId, this.trust);
       if (!session.latestSnapshot || BigInt(session.outstandingWorstCaseReservationsUsdcMicros) !== 0n) fail('G3C_SESSION_RECONCILIATION_REQUIRED');
       const checked = evidence(currentAccountSnapshot, this.trust, nowMs); const snapshot = accountPayload(checked);
@@ -1070,7 +1244,8 @@ export class G3cExecutionStore {
           snapshot.blockFinality !== 'finalized' || BigInt(snapshot.blockNumber) < lastApprovalBlock ||
           BigInt(snapshot.pendingNonce) <= lastApprovalNonce || snapshot.allowanceToken.toLowerCase() !== expectedToken.toLowerCase() ||
           snapshot.allowanceSpender.toLowerCase() !== BASE_UNISWAP_V3.router.toLowerCase() ||
-          BigInt(snapshot.allowanceAtomic) > BigInt(parent.transaction.amountIn)) fail('G3C_APPROVAL_ONLY_ACCOUNT_INVALID');
+          BigInt(snapshot.allowanceAtomic) > BigInt(parent.transaction.amountIn) ||
+          (browserEarly && BigInt(snapshot.allowanceAtomic) !== BigInt(parent.transaction.amountIn))) fail('G3C_APPROVAL_ONLY_ACCOUNT_INVALID');
       const accounting = accountSessionSnapshot(session, snapshot);
       const next = nextSession(session, { status: accounting.status,
         unrealizedLossUsdcMicros: accounting.unrealizedLossUsdcMicros,
@@ -1085,7 +1260,7 @@ export class G3cExecutionStore {
         remainingAllowanceAtomic: snapshot.allowanceAtomic, allowanceToken: snapshot.allowanceToken,
         freshPolicyEvaluationRequired: true,
       }, at);
-      releaseParent(db, parent, 'G3C_APPROVAL_ONLY_EXPIRED_OR_STOPPED', at);
+      releaseParent(db, parent, browserEarly ? 'G3C_BROWSER_APPROVAL_FINALIZED' : 'G3C_APPROVAL_ONLY_EXPIRED_OR_STOPPED', at);
       if (accounting.status === 'STOPPED' && session.status !== 'STOPPED') writeEvent(db, session.sessionId, 'G3C_SESSION_STOPPED',
         accounting.stopReasons.join('|'), { executionId, sessionId: session.sessionId, projectedLossUsdcMicros: accounting.projectedLossUsdcMicros }, at);
     });

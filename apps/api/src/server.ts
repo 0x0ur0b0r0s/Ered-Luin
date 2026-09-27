@@ -13,6 +13,7 @@ import { BaseD2PolicyProvider } from './d2-base-provider.js';
 import { createD2ProductionService } from './d2-production.js';
 import { createD2FreshAnalysisService } from './d2-fresh-analysis.js';
 import { createD2ExecutionService } from './d2-execution.js';
+import { createD2BrowserExecutionService } from './d2-browser-execution.js';
 import { createProductionG3cSigner } from './g3c-signer-client.js';
 import { openD2AuditStore } from './d2-audit-store.js';
 import { DEFAULT_D2_RPC_MAX_REQUESTS, DEFAULT_D2_RPC_RECOVERY_RESERVE, MIN_D2_RPC_RECOVERY_RESERVE, RpcRunBudget } from './rpc-budget.js';
@@ -67,6 +68,12 @@ if (baseReadsEnabled && (!deploymentReviewed || !alchemyBudgetVerified)) {
 }
 const reviewedExecutionGate = config.LIVE_EXECUTION_ENABLED === 'true' && config.EXECUTION_MODE === 'live-reviewed' &&
   executionReviewed && g3cReviewed && deploymentReviewed && alchemyBudgetVerified && baseReadsEnabled && operatorAuth.configured;
+const browserWalletRequested = envBoolean('D2_BROWSER_WALLET_ENABLED');
+const browserWalletReviewed = envBoolean('D2_BROWSER_WALLET_REVIEWED');
+const browserWalletEnabled = browserWalletRequested && browserWalletReviewed && config.LIVE_EXECUTION_ENABLED === 'true' &&
+  config.EXECUTION_MODE === 'browser-wallet-reviewed' && executionReviewed && g3cReviewed && deploymentReviewed &&
+  alchemyBudgetVerified && baseReadsEnabled && operatorAuth.configured;
+if (browserWalletRequested && !browserWalletEnabled) throw new Error('Browser wallet submission requires its separate reviewed gate, read-only Base RPC, and operator authentication.');
 if ((signingRequested || submissionRequested) && !reviewedExecutionGate) {
   throw new Error('D2 signing/submission require live-reviewed mode, reviewed deployment, verified RPC budget, Base reads, and configured operator authentication.');
 }
@@ -176,6 +183,9 @@ const d2Execution = d2Production
     submissionEnabled: submissionRequested && reviewedExecutionGate && broadcasterDeployed,
   })
   : undefined;
+const d2BrowserExecution = observations && d2Production && baseProvider
+  ? createD2BrowserExecutionService({ production: d2Production, store: g3cStatusStore, provider: baseProvider, enabled: browserWalletEnabled })
+  : undefined;
 const d2FreshAnalysis = observations && d2Production ? createD2FreshAnalysisService({
   observations, proposal: (proposalId) => d2Production.proposal(proposalId),
   ...(g1dAuditStore ? { auditStore: g1dAuditStore } : {}),
@@ -191,10 +201,10 @@ function runtimeStatus(): D2Runtime {
   const submissionEnabled = d2Execution?.submissionEnabled ?? false;
   return {
     service: 'ered-luin-api', status: observations && d2Audit ? 'ok' : 'degraded',
-    appMode: signingEnabled || submissionEnabled ? 'LIVE_REVIEWED' : 'PRODUCTION_READ_ONLY',
+    appMode: signingEnabled || submissionEnabled || browserWalletEnabled ? 'LIVE_REVIEWED' : 'PRODUCTION_READ_ONLY',
     paidNansenCallsEnabled: false, activeNansenCreditBudget: 0,
-    liveExecutionEnabled: signingEnabled || submissionEnabled,
-    executionControls: { operatorAuthConfigured: operatorAuth.configured, signingEnabled, submissionEnabled, reviewedMode },
+    liveExecutionEnabled: signingEnabled || submissionEnabled || browserWalletEnabled,
+    executionControls: { operatorAuthConfigured: operatorAuth.configured, signingEnabled, submissionEnabled, reviewedMode, browserWalletEnabled },
     nansenObservationStore: observations ? 'configured' : 'unconfigured',
     productionEvaluation: d2Production ? 'configured' : 'unconfigured',
     baseRpc: baseReadsEnabled ? 'read_only_enabled' : 'disabled',
@@ -205,7 +215,7 @@ function runtimeStatus(): D2Runtime {
 export const app = createApiApp({
   store, dataProvider: provider, g3cStatusReader: g3cStatusStore, d2Runtime: runtimeStatus, operatorAuth,
   ...(d1Demo ? { d1Demo } : {}), ...(d2Production ? { d2Production } : {}),
-  ...(d2FreshAnalysis ? { d2FreshAnalysis } : {}), ...(d2Execution ? { d2Execution } : {}),
+  ...(d2FreshAnalysis ? { d2FreshAnalysis } : {}), ...(d2Execution ? { d2Execution } : {}), ...(d2BrowserExecution ? { d2BrowserExecution } : {}),
 });
 if (signer) app.addHook('onClose', async () => { await signer?.close(); });
 if (broadcaster) app.addHook('onClose', async () => { broadcaster?.close(); });

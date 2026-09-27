@@ -8,7 +8,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it } from 'vitest';
 import type { Hex } from 'viem';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
-import type { G3cEvidenceAttestation, TradeIntent } from '@ered-luin/contracts';
+import type { G3bUnsignedTransaction, G3cEvidenceAttestation, TradeIntent } from '@ered-luin/contracts';
 import { canonicalJson, d2ProposalSchema } from '@ered-luin/contracts';
 import { initializeExecutionStore, openExecutionStore, type ExecutionStore } from './execution-store.js';
 import { openPaperStore } from './paper-store.js';
@@ -182,6 +182,7 @@ function makeSeparatedProductionProvider(ctx: ReturnType<typeof setup>, options:
   const startedAtMs = nowMs;
   let approved = false;
   let broadcastHash: Hex | null = null;
+  let broadcastTransaction: G3bUnsignedTransaction | null = null;
   const hashFor = (number: bigint): Hex => ('0x' + number.toString(16).padStart(64, '0')) as Hex;
   const heads = () => {
     const elapsedBlocks = BigInt(Math.max(0, Math.floor((nowMs - startedAtMs) / 2_000)));
@@ -206,7 +207,11 @@ function makeSeparatedProductionProvider(ctx: ReturnType<typeof setup>, options:
     async estimateFeesPerGas() { return { maxFeePerGas: 2n, maxPriorityFeePerGas: 1n }; },
     async getTransaction(input: { hash: Hex }) {
       if (!approved || input.hash.toLowerCase() !== broadcastHash?.toLowerCase()) throw new Error('Synthetic transaction is not known');
-      return { hash: input.hash, from: ctx.wallet, nonce: 0n };
+      const tx = broadcastTransaction;
+      return tx ? { hash: input.hash, type: 'eip1559', chainId: 8453, from: tx.from, to: tx.to, input: tx.data,
+        value: BigInt(tx.valueWei), nonce: Number(tx.nonce), gas: BigInt(tx.gasLimit),
+        maxFeePerGas: BigInt(tx.maxFeePerGasWei), maxPriorityFeePerGas: BigInt(tx.maxPriorityFeePerGasWei), accessList: [] }
+        : { hash: input.hash, from: ctx.wallet, nonce: 0n };
     },
     async getTransactionReceipt(input: { hash: Hex }) {
       if (!approved || input.hash.toLowerCase() !== broadcastHash?.toLowerCase()) throw new Error('Synthetic receipt is not ready');
@@ -243,7 +248,7 @@ function makeSeparatedProductionProvider(ctx: ReturnType<typeof setup>, options:
     clock: ctx.clock, client: rpc as never });
   return {
     provider,
-    markBroadcast(hash: Hex) { broadcastHash = hash; approved = true; },
+    markBroadcast(hash: Hex, transaction?: G3bUnsignedTransaction) { broadcastHash = hash; broadcastTransaction = transaction ?? null; approved = true; },
   };
 }
 
@@ -426,7 +431,7 @@ describe('G3c durable Base execution path', () => {
       await broadcastBaseG3cOperation({ store: ctx.g3c, operationId, broadcaster: {
         async sendRawTransaction() {
           const hash = signed.workflow.transactionHash as Hex;
-          markBroadcast(hash);
+          markBroadcast(hash, signed.workflow.unsignedTransaction);
           return hash;
         },
       }, reason: 'synthetic approval broadcast', clock: ctx.clock });
@@ -896,6 +901,45 @@ describe('G3c durable Base execution path', () => {
 
 
 
+describe('G3c browser-wallet durable state', () => {
+  it('persists browser submission before wallet access, excludes the app signer, and releases only on explicit rejection', () => {
+    const ctx = setup({ g3cOptions: { allowTestSigning: true, allowTestBroadcast: true } });
+    const session = startFixtureSession(ctx);
+    const workflow = ctx.g3c.prepareOperation({ ...workflowInput(ctx, session.snapshot), sessionId: session.sessionId }).workflow;
+    const ready = ctx.g3c.prepareBrowserWallet(workflow.operationId, 'synthetic browser wallet pending record');
+    expect(ready.workflow).toMatchObject({ submissionMode: 'BROWSER_WALLET', browserStage: 'READY', status: 'AUTHORIZED',
+      signedBytesHex: null, signedBytesDigest: null, transactionHash: null });
+    expect(ready.replayed).toBe(false);
+    expect(ctx.g3c.prepareBrowserWallet(workflow.operationId, 'synthetic duplicate pending record').replayed).toBe(true);
+    expect(ctx.g3c.getSession(session.sessionId).outstandingWorstCaseReservationsUsdcMicros).not.toBe('0');
+    let signerError: unknown;
+    try { ctx.g3c.claimForSigning(workflow.operationId, session.snapshot, 'must not enter local signer'); } catch (error) { signerError = error; }
+    expect(signerError).toMatchObject({ reason: 'G3C_SIGNING_CLAIM_INVALID' });
+
+    const armed = ctx.g3c.armBrowserWalletSubmission(workflow.operationId, session.snapshot, 'synthetic before Rabby request');
+    expect(armed.workflow).toMatchObject({ status: 'SUBMISSION_UNCERTAIN', browserStage: 'SUBMISSION_UNCERTAIN', submissionAttempts: 1 });
+    const rejected = ctx.g3c.rejectBrowserWalletSubmission(workflow.operationId, 'Rabby returned EIP-1193 user rejection code 4001');
+    expect(rejected.workflow).toMatchObject({ status: 'CANCELLED', browserStage: 'REJECTED', failureReason: 'WALLET_USER_REJECTED' });
+    expect(ctx.g3c.getSession(session.sessionId).outstandingWorstCaseReservationsUsdcMicros).toBe('0');
+    expect(ctx.execution.get(ctx.parent.executionId).status).toBe('RELEASED');
+  });
+
+  it('retains unknown transaction hashes and reservations without permitting a second hash', () => {
+    const ctx = setup({ g3cOptions: { allowTestSigning: true, allowTestBroadcast: true } });
+    const session = startFixtureSession(ctx);
+    const workflow = ctx.g3c.prepareOperation({ ...workflowInput(ctx, session.snapshot), sessionId: session.sessionId }).workflow;
+    ctx.g3c.prepareBrowserWallet(workflow.operationId, 'synthetic browser wallet pending record');
+    ctx.g3c.armBrowserWalletSubmission(workflow.operationId, session.snapshot, 'synthetic before Rabby request');
+    const unknownHash = HASHES[0]!;
+    const uncertain = ctx.g3c.recordBrowserTransaction(workflow.operationId, unknownHash, 'NOT_FOUND', 'synthetic RPC not found yet');
+    expect(uncertain.workflow).toMatchObject({ status: 'SUBMISSION_UNCERTAIN', browserStage: 'SUBMISSION_UNCERTAIN', transactionHash: unknownHash });
+    expect(ctx.g3c.getSession(session.sessionId).outstandingWorstCaseReservationsUsdcMicros).not.toBe('0');
+    let hashError: unknown;
+    try { ctx.g3c.recordBrowserTransaction(workflow.operationId, HASHES[1]!, 'MATCH', 'must preserve first hash'); } catch (error) { hashError = error; }
+    expect(hashError).toMatchObject({ reason: 'G3C_BROWSER_HASH_CONFLICT' });
+    expect(ctx.g3c.getWorkflow(workflow.operationId).transactionHash).toBe(unknownHash);
+  });
+});
 describe('G3c read-only simulation boundary', () => {
   it('validates exact G2 amount and Base evidence without persisting G3c authorization', async () => {
     const ctx = setup();

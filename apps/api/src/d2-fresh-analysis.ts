@@ -96,7 +96,7 @@ function proposalMatches(proposal: D2Proposal | null, snapshots: readonly Observ
   if (proposal.evidence.source !== 'nansen' || proposal.evidence.batches.some((batch) => batch.source !== 'nansen') ||
       !sameIds(proposal.evidence.batches.map((batch) => batch.snapshotId), snapshots.map((snapshot) => snapshot.snapshotId))) return 'MISMATCHED';
   const required = [
-    proposal.evidence.observations.find((signal) => signal.endpoint === 'TOKEN_SCREENER' && signal.asset === 'USDC' && signal.metric === 'price_usd'),
+    proposal.evidence.observations.find((signal) => (signal.endpoint === 'TOKEN_OHLCV' || signal.endpoint === 'TOKEN_SCREENER') && signal.asset === 'USDC' && signal.metric === 'price_usd'),
     proposal.evidence.observations.find((signal) => signal.endpoint === 'TOKEN_SCREENER' && signal.asset === 'WETH' && signal.metric === 'price_usd'),
     proposal.evidence.observations.find((signal) => signal.endpoint === 'SMART_MONEY_NETFLOW' && signal.asset === 'WETH' && signal.metric === 'net_flow_1h_usd'),
   ];

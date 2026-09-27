@@ -1,13 +1,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { d2Api, type D2ExecutionAction, type D2Runtime } from './api-client.js';
+import { d2Api, type D2ExecutionAction, type D2Proposal, type D2Runtime, type D2Session } from './api-client.js';
 
 const hookHarness = vi.hoisted(() => {
   let values: unknown[] = [];
   let cursor = 0;
   let effect: (() => unknown) | undefined;
-  let reference: { current: unknown } | undefined;
+  let references: { current: unknown }[] = [];
   return {
-    reset() { values = []; cursor = 0; effect = undefined; reference = undefined; },
+    reset() { values = []; cursor = 0; effect = undefined; references = []; },
     beginRender() { cursor = 0; },
     useState(initial: unknown) {
       const index = cursor++;
@@ -17,9 +17,9 @@ const hookHarness = vi.hoisted(() => {
       }];
     },
     useRef(initial: unknown) {
-      cursor += 1;
-      reference ??= { current: initial };
-      return reference;
+      const index = cursor++;
+      references[index] ??= { current: initial };
+      return references[index];
     },
     useEffect(callback: () => unknown) { effect ??= callback; },
     runEffect() { return effect?.(); },
@@ -44,7 +44,7 @@ const SESSION_ID = '00000000-0000-4000-8000-000000000303';
 const STALE_HASH = '0x' + 'cd'.repeat(32);
 
 type Node = { readonly type?: unknown; readonly props?: { readonly children?: unknown; readonly value?: unknown;
-  readonly onChange?: (event: { readonly target: { readonly value: string } }) => void; readonly onClick?: () => void } };
+  readonly onChange?: (event: { readonly target: { readonly value: string } }) => void; readonly onClick?: () => void; readonly onContextInvalidated?: () => void } };
 function flatten(value: unknown): Node[] {
   if (Array.isArray(value)) return value.flatMap(flatten);
   if (typeof value !== 'object' || value === null) return [];
@@ -59,7 +59,11 @@ function text(value: unknown): string {
   if (typeof node.type === 'function') return text((node.type as (props: unknown) => unknown)(node.props));
   return text(node.props?.children);
 }
-function settle() { return new Promise<void>((resolve) => setTimeout(resolve, 0)); }
+function settle() { return new Promise<void>((resolve) => setTimeout(resolve, 0)); }function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((ok) => { resolve = ok; });
+  return { promise, resolve };
+}
 
 describe('D2 execution dashboard selection safety', () => {
   afterEach(() => hookHarness.reset());
@@ -69,7 +73,7 @@ describe('D2 execution dashboard selection safety', () => {
     const runtime: D2Runtime = {
       service: 'ered-luin-api', status: 'ok', appMode: 'PRODUCTION_READ_ONLY',
       paidNansenCallsEnabled: false, activeNansenCreditBudget: 0, liveExecutionEnabled: false,
-      executionControls: { operatorAuthConfigured: true, signingEnabled: true, submissionEnabled: false, reviewedMode: false },
+      executionControls: { operatorAuthConfigured: true, signingEnabled: true, submissionEnabled: false, reviewedMode: false, browserWalletEnabled: false },
       nansenObservationStore: 'configured', productionEvaluation: 'configured', baseRpc: 'read_only_enabled',
       g3cStatusReader: 'configured', rpcRunBudget: null,
     };
@@ -123,11 +127,71 @@ describe('D2 execution dashboard selection safety', () => {
     expect(text(tree)).not.toContain(STALE_HASH);
     expect(text(tree)).not.toContain('SUBMITTED');
   });
+  it.each(['proposal', 'session'] as const)('drops a pending %s result when Rabby context is invalidated', async (kind) => {
+    const runtime: D2Runtime = {
+      service: 'ered-luin-api', status: 'ok', appMode: 'PRODUCTION_READ_ONLY',
+      paidNansenCallsEnabled: false, activeNansenCreditBudget: 0, liveExecutionEnabled: false,
+      executionControls: { operatorAuthConfigured: true, signingEnabled: false, submissionEnabled: false, reviewedMode: false, browserWalletEnabled: false },
+      nansenObservationStore: 'configured', productionEvaluation: 'configured', baseRpc: 'read_only_enabled',
+      g3cStatusReader: 'configured', rpcRunBudget: null,
+    };
+    const pendingProposal = deferred<D2Proposal>();
+    const pendingSession = deferred<D2Session>();
+    const proposalResult: D2Proposal = {
+      proposalId: PROPOSAL_ID, createdAt: '2026-09-24T18:00:00.000Z',
+      intent: { intentId: PROPOSAL_ID, walletAddress: '0x1111111111111111111111111111111111111111', chainId: 8453,
+        sellAsset: 'USDC', buyAsset: 'WETH', amountIn: '4000000', issuedAt: '2026-09-24T18:00:00.000Z', expiresAt: '2026-09-24T18:01:00.000Z' },
+      analysis: { source: 'DETERMINISTIC_EVIDENCE_RULES', version: 'd2-rule-v1', rationale: 'STALE_PROPOSAL_RESULT',
+        semanticStatus: 'UNAVAILABLE', semanticAuthority: 'NONE', semanticHandoff: {
+          status: 'UNAVAILABLE', provider: 'none', authority: 'NONE', source: 'none', reason: 'HANDOFF_DISABLED',
+        } },
+      evidence: { source: 'nansen', label: 'PERSISTED NANSEN OBSERVATIONS', observations: [], observationIds: [], batches: [] },
+    };
+    const sessionResult: D2Session = {
+      sessionId: SESSION_ID, walletAddress: '0x1111111111111111111111111111111111111111', status: 'ACTIVE',
+      initialEquityUsdcMicros: '1000000', latestAccountVersion: 1, createdAt: '2026-09-24T18:00:00.000Z',
+    };
+    const api = {
+      runtime: async () => runtime,
+      evidence: async () => ({ source: 'nansen', label: 'PERSISTED NANSEN OBSERVATIONS', observations: [], batches: [], freshness: 'missing' }),
+      operatorSession: async () => ({ configured: true, authenticated: true, expiresAt: null }),
+      proposal: vi.fn(() => pendingProposal.promise),
+      startSession: vi.fn(() => pendingSession.promise),
+    } as unknown as typeof d2Api;
+    function render() { hookHarness.beginRender(); return D2ProductionPanel({ api }); }
+
+    let tree = render();
+    hookHarness.runEffect();
+    await settle();
+    tree = render();
+    let elements = flatten(tree);
+    const walletLabel = elements.filter((element) => element.type === 'label')
+      .find((label) => text(label).includes('Wallet public address'));
+    const walletInput = walletLabel && flatten(walletLabel).find((element) => element.type === 'input');
+    walletInput!.props!.onChange!({ target: { value: '0x1111111111111111111111111111111111111111' } });
+    tree = render();
+    elements = flatten(tree);
+    const actionLabel = kind === 'proposal' ? 'Create proposal' : 'Start read-only session';
+    const action = elements.find((element) => element.type === 'button' && text(element).includes(actionLabel));
+    expect(action?.props?.onClick).toBeTypeOf('function');
+    action!.props!.onClick!();
+    tree = render();
+    const walletPanel = flatten(tree).find((element) => typeof element.props?.onContextInvalidated === 'function');
+    expect(walletPanel?.props?.onContextInvalidated).toBeTypeOf('function');
+    walletPanel!.props!.onContextInvalidated!();
+
+    if (kind === 'proposal') pendingProposal.resolve(proposalResult);
+    else pendingSession.resolve(sessionResult);
+    await settle();
+    tree = render();
+    if (kind === 'proposal') expect(text(tree)).not.toContain('STALE_PROPOSAL_RESULT');
+    else expect(text(tree)).not.toContain(SESSION_ID.slice(0, 8));
+  });
   it('renders stored G1d provenance as advisory metadata rather than approval', async () => {
     const runtime: D2Runtime = {
       service: 'ered-luin-api', status: 'ok', appMode: 'PRODUCTION_READ_ONLY',
       paidNansenCallsEnabled: false, activeNansenCreditBudget: 0, liveExecutionEnabled: false,
-      executionControls: { operatorAuthConfigured: true, signingEnabled: false, submissionEnabled: false, reviewedMode: false },
+      executionControls: { operatorAuthConfigured: true, signingEnabled: false, submissionEnabled: false, reviewedMode: false, browserWalletEnabled: false },
       nansenObservationStore: 'configured', productionEvaluation: 'configured', baseRpc: 'disabled',
       g3cStatusReader: 'configured', rpcRunBudget: null,
     };
@@ -208,3 +272,32 @@ describe('D2 execution dashboard selection safety', () => {
     expect(text(tree)).toContain('REQUESTS / AUTHORITY');
   });
 });
+  it('labels D2v OHLCV evidence as a recent candle rather than an executable quote', async () => {
+    const runtime: D2Runtime = {
+      service: 'ered-luin-api', status: 'ok', appMode: 'PRODUCTION_READ_ONLY', paidNansenCallsEnabled: false,
+      activeNansenCreditBudget: 0, liveExecutionEnabled: false,
+      executionControls: { operatorAuthConfigured: false, signingEnabled: false, submissionEnabled: false, reviewedMode: false, browserWalletEnabled: false },
+      nansenObservationStore: 'configured', productionEvaluation: 'configured', baseRpc: 'disabled',
+      g3cStatusReader: 'configured', rpcRunBudget: null,
+    };
+    const signalId = '00000000-0000-4000-8000-000000000304';
+    const api = {
+      runtime: async () => runtime,
+      evidence: async () => ({ source: 'nansen', label: 'PERSISTED NANSEN OBSERVATIONS', freshness: 'fresh', observations: [{
+        signalId, provider: 'nansen', endpoint: 'TOKEN_OHLCV', chainId: 8453, asset: 'USDC', metric: 'price_usd',
+        observedAt: '2026-09-27T12:00:00.000Z', fetchedAt: '2026-09-27T12:01:01.000Z', timeframe: '1m', quality: 'COMPLETE',
+        value: '1000000', unit: 'usd_micros', provenanceId: 'synthetic-d2v-ui-test',
+      }], batches: [{ snapshotId: '00000000-0000-4000-8000-000000000305', operation: 'TOKEN_OHLCV', timeframe: '1m',
+        status: 'fresh', completeness: 'complete', fetchedAt: '2026-09-27T12:01:01.000Z', acquiredAt: '2026-09-27T12:01:02.000Z',
+        expiresAt: '2026-09-27T12:02:02.000Z', ageMs: 62_000, pageBound: 1, retryBound: 0, pageReferences: [],
+        observationIds: [signalId], unavailableFields: [] }] }),
+      operatorSession: async () => ({ configured: false, authenticated: false, expiresAt: null }),
+    } as unknown as typeof d2Api;
+    function render() { hookHarness.beginRender(); return D2ProductionPanel({ api }); }
+    let tree = render();
+    hookHarness.runEffect();
+    await settle();
+    tree = render();
+    expect(text(tree)).toContain('Recent Nansen 1m candle price');
+    expect(text(tree)).toContain('not an executable swap quote');
+  });

@@ -12,6 +12,7 @@ import {
   type PageReference,
   type SmartMoneyNetflowToken,
   type TokenScreenerToken,
+  type TokenOhlcvCandle,
 } from './client.js';
 import { NansenClientError } from './client.js';
 import { NANSEN_OPERATION_COSTS, type NansenOperation } from './index.js';
@@ -21,11 +22,13 @@ export const QUERY_CACHE_TTL_MS = Object.freeze({
   TOKEN_SCREENER: 5 * 60 * 1_000,
   FLOW_INTELLIGENCE: 5 * 60 * 1_000,
   SMART_MONEY_NETFLOW: 30 * 60 * 1_000,
+  TOKEN_OHLCV: 60 * 1_000,
 });
 export const SIGNAL_FRESHNESS_MS = Object.freeze({
   TOKEN_SCREENER: 10 * 60 * 1_000,
   FLOW_INTELLIGENCE: 10 * 60 * 1_000,
   SMART_MONEY_NETFLOW: 35 * 60 * 1_000,
+  TOKEN_OHLCV: 10 * 60 * 1_000,
 });
 export const MAX_QUERY_PAGE_BOUND = 20;
 export const MAX_QUERY_RETRY_BOUND = 2;
@@ -36,9 +39,10 @@ export const WETH_RESEARCH_MAX_CACHE_AGE_MS = 5 * 60 * 1_000;
 export const WETH_RESEARCH_V2_MAX_CACHE_AGE_MS = 3 * 60 * 1_000;
 
 export type NansenManagedQuery =
-  | { readonly operation: 'TOKEN_SCREENER'; readonly asset: 'BASE_PAIR'; readonly timeframe: '1h'; readonly pageBound: number; readonly retryBound: number; readonly perPage: number }
+  | { readonly operation: 'TOKEN_SCREENER'; readonly asset: 'BASE_PAIR' | 'USDC'; readonly timeframe: '1h'; readonly pageBound: number; readonly retryBound: number; readonly perPage: number }
   | { readonly operation: 'FLOW_INTELLIGENCE'; readonly asset: 'WETH'; readonly timeframe: '1h'; readonly pageBound: 1; readonly retryBound: number; readonly perPage: 1 }
-  | { readonly operation: 'SMART_MONEY_NETFLOW'; readonly asset: 'BASE_PAIR'; readonly timeframe: '1h'; readonly pageBound: number; readonly retryBound: number; readonly perPage: number };
+  | { readonly operation: 'SMART_MONEY_NETFLOW'; readonly asset: 'BASE_PAIR'; readonly timeframe: '1h'; readonly pageBound: number; readonly retryBound: number; readonly perPage: number }
+  | { readonly operation: 'TOKEN_OHLCV'; readonly asset: 'USDC'; readonly timeframe: '1m'; readonly date: { readonly from: string; readonly to: string }; readonly historical?: true; readonly pageBound: 1; readonly retryBound: 0; readonly perPage: 1 };
 export const WETH_RESEARCH_QUERIES = Object.freeze({
   TOKEN_SCREENER: Object.freeze({ operation: 'TOKEN_SCREENER', asset: 'BASE_PAIR', timeframe: '1h', pageBound: 1, retryBound: 0, perPage: 100 }) as NansenManagedQuery,
   SMART_MONEY_NETFLOW: Object.freeze({ operation: 'SMART_MONEY_NETFLOW', asset: 'BASE_PAIR', timeframe: '1h', pageBound: 1, retryBound: 0, perPage: 100 }) as NansenManagedQuery,
@@ -51,7 +55,7 @@ export interface ManagedQueryResult {
   readonly cacheKey: string;
   readonly operation: NansenOperation;
   readonly asset: 'BASE_PAIR' | 'USDC' | 'WETH';
-  readonly timeframe: '1h';
+  readonly timeframe: '1h' | '1m';
   readonly pageBound: number;
   readonly retryBound: number;
   readonly status: ManagedQueryStatus;
@@ -105,7 +109,7 @@ interface ManagerConfig {
   readonly onDiagnostic?: ((diagnostic: ManagedQueryDiagnostic) => void) | undefined;
   readonly cachePolicy?: 'weth-research-v1' | 'weth-research-v2' | undefined;
 }
-type QueryData = readonly (TokenScreenerToken | FlowIntelligenceRow | SmartMoneyNetflowToken)[];
+type QueryData = readonly (TokenScreenerToken | FlowIntelligenceRow | SmartMoneyNetflowToken | TokenOhlcvCandle)[];
 interface AttemptResult { readonly data: QueryData; readonly completeness: AdapterCompleteness; readonly failure: AdapterFailure | null; readonly refs: readonly PageReference[]; readonly unavailable: readonly string[]; readonly diagnostics: AdapterEvidenceDiagnostics | null; }
 
 function now(clock: () => Date): number {
@@ -121,7 +125,7 @@ function validateConfig(value: unknown): ManagerConfig {
   if (Object.keys(options).some((key) => !allowed.includes(key))) throw new NansenClientError('INVALID_CONFIGURATION');
   const client = options.client as NansenClient | undefined;
   const store = options.store as NansenObservationStore | undefined;
-  if (!client || typeof client.tokenScreener !== 'function' || typeof client.flowIntelligence !== 'function' || typeof client.smartMoneyNetflow !== 'function' ||
+  if (!client || typeof client.tokenScreener !== 'function' || typeof client.flowIntelligence !== 'function' || typeof client.smartMoneyNetflow !== 'function' || typeof client.tokenOhlcv !== 'function' ||
       !store || typeof store.getFreshCache !== 'function' || typeof store.writeSnapshot !== 'function') throw new NansenClientError('INVALID_CONFIGURATION');
   const enabled = options.enabled ?? false;
   const source = getNansenClientProvenance(client);
@@ -146,24 +150,72 @@ function validateConfig(value: unknown): ManagerConfig {
 function validateQuery(value: unknown, config: ManagerConfig): NansenManagedQuery {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new NansenClientError('INVALID_REQUEST');
   const q = value as Record<string, unknown>;
-  const expected = ['operation', 'asset', 'timeframe', 'pageBound', 'retryBound', 'perPage'];
+  const expected = q.operation === 'TOKEN_OHLCV'
+    ? (q.historical === true
+      ? ['operation', 'asset', 'timeframe', 'date', 'historical', 'pageBound', 'retryBound', 'perPage']
+      : ['operation', 'asset', 'timeframe', 'date', 'pageBound', 'retryBound', 'perPage'])
+    : ['operation', 'asset', 'timeframe', 'pageBound', 'retryBound', 'perPage'];
   if (Object.keys(q).length !== expected.length || Object.keys(q).some((key) => !expected.includes(key)) ||
-      q.timeframe !== '1h' || !Number.isSafeInteger(q.pageBound) || Number(q.pageBound) < 1 || Number(q.pageBound) > config.maxPageBound ||
+      !Number.isSafeInteger(q.pageBound) || Number(q.pageBound) < 1 || Number(q.pageBound) > config.maxPageBound ||
       !Number.isSafeInteger(q.retryBound) || Number(q.retryBound) < 0 || Number(q.retryBound) > config.maxRetryBound ||
       !Number.isSafeInteger(q.perPage) || Number(q.perPage) < 1 || Number(q.perPage) > MAX_PER_PAGE) throw new NansenClientError('INVALID_REQUEST');
+  if (q.operation === 'TOKEN_OHLCV') {
+    if (q.asset !== 'USDC' || q.timeframe !== '1m' || q.pageBound !== 1 || q.retryBound !== 0 || q.perPage !== 1 ||
+        typeof q.date !== 'object' || q.date === null || Array.isArray(q.date)) throw new NansenClientError('INVALID_REQUEST');
+    const date = q.date as Record<string, unknown>;
+    if (Object.keys(date).length !== 2 || typeof date.from !== 'string' || typeof date.to !== 'string') throw new NansenClientError('INVALID_REQUEST');
+    const fromMs = Date.parse(date.from), toMs = Date.parse(date.to), nowMs = now(config.clock);
+    const endMs = Math.floor(nowMs / 60_000) * 60_000;
+    const historical = q.historical === true;
+    if (!Number.isSafeInteger(fromMs) || !Number.isSafeInteger(toMs) || fromMs % 60_000 !== 0 || toMs % 60_000 !== 0 ||
+        toMs - fromMs !== 10 * 60_000 || (historical ? toMs > endMs : toMs !== endMs || fromMs !== endMs - 10 * 60_000) ||
+        new Date(fromMs).toISOString() !== date.from || new Date(toMs).toISOString() !== date.to) {
+      throw new NansenClientError('INVALID_REQUEST');
+    }
+    return Object.freeze(q as unknown as NansenManagedQuery);
+  }
+  if (q.timeframe !== '1h') throw new NansenClientError('INVALID_REQUEST');
   if (q.operation === 'TOKEN_SCREENER' && q.asset === 'BASE_PAIR') return Object.freeze(q as unknown as NansenManagedQuery);
+  if (q.operation === 'TOKEN_SCREENER' && q.asset === 'USDC' && q.pageBound === 1 && q.retryBound === 0 && q.perPage === 100) return Object.freeze(q as unknown as NansenManagedQuery);
   if (q.operation === 'SMART_MONEY_NETFLOW' && q.asset === 'BASE_PAIR') return Object.freeze(q as unknown as NansenManagedQuery);
   if (q.operation === 'FLOW_INTELLIGENCE' && q.asset === 'WETH' && q.pageBound === 1 && q.perPage === 1) return Object.freeze(q as unknown as NansenManagedQuery);
   throw new NansenClientError('INVALID_REQUEST');
 }
 function canonicalQuery(q: NansenManagedQuery, source: 'nansen' | 'synthetic'): string {
+  if (q.operation === 'TOKEN_OHLCV') {
+    if (q.historical === true) return JSON.stringify({ operation: q.operation, asset: q.asset, timeframe: q.timeframe,
+      date: q.date, historical: true, pageBound: q.pageBound, retryBound: q.retryBound, perPage: q.perPage, source, schema: 1 });
+    return JSON.stringify({ operation: q.operation, asset: q.asset, timeframe: q.timeframe, window: 'last-10-completed-minutes',
+      pageBound: q.pageBound, retryBound: q.retryBound, perPage: q.perPage, source, schema: 3 });
+  }
   return JSON.stringify({ operation: q.operation, asset: q.asset, timeframe: q.timeframe, pageBound: q.pageBound, retryBound: q.retryBound, perPage: q.perPage, source, schema: 2 });
 }
 function digest(value: string): string { return createHash('sha256').update(value, 'utf8').digest('hex'); }
+export function historicalBaseUsdcOhlcvCacheKey(query: NansenManagedQuery): string {
+  if (query.operation !== 'TOKEN_OHLCV' || query.historical !== true) throw new NansenClientError('INVALID_REQUEST');
+  return digest(canonicalQuery(query, 'nansen'));
+}
 export const WETH_RESEARCH_CACHE_KEYS = Object.freeze({
   TOKEN_SCREENER: digest(canonicalQuery(WETH_RESEARCH_QUERIES.TOKEN_SCREENER, 'nansen')),
   SMART_MONEY_NETFLOW: digest(canonicalQuery(WETH_RESEARCH_QUERIES.SMART_MONEY_NETFLOW, 'nansen')),
 });
+export const BASE_USDC_PRICE_QUERY = Object.freeze({
+  operation: 'TOKEN_SCREENER', asset: 'USDC', timeframe: '1h', pageBound: 1, retryBound: 0, perPage: 100,
+}) as NansenManagedQuery;
+export const BASE_USDC_PRICE_CACHE_KEY = digest(canonicalQuery(BASE_USDC_PRICE_QUERY, 'nansen'));
+const BASE_USDC_OHLCV_QUERY_IDENTITY = Object.freeze({ operation: 'TOKEN_OHLCV', asset: 'USDC', timeframe: '1m', date: { from: '2000-01-01T00:00:00.000Z', to: '2000-01-01T00:10:00.000Z' }, pageBound: 1, retryBound: 0, perPage: 1 }) as NansenManagedQuery;
+export const BASE_USDC_OHLCV_PRICE_CACHE_KEY = digest(canonicalQuery(BASE_USDC_OHLCV_QUERY_IDENTITY, 'nansen'));
+export function createBaseUsdcOhlcvPriceQuery(at: Date = new Date()): NansenManagedQuery {
+  if (!(at instanceof Date) || !Number.isSafeInteger(at.getTime()) || at.getTime() < 0) throw new NansenClientError('INVALID_REQUEST');
+  const toMs = Math.floor(at.getTime() / 60_000) * 60_000;
+  return Object.freeze({ ...BASE_USDC_OHLCV_QUERY_IDENTITY, date: Object.freeze({ from: new Date(toMs - 10 * 60_000).toISOString(), to: new Date(toMs).toISOString() }) });
+}
+export function createHistoricalBaseUsdcOhlcvQuery(from: Date, to: Date): NansenManagedQuery {
+  if (!(from instanceof Date) || !(to instanceof Date) || !Number.isSafeInteger(from.getTime()) || !Number.isSafeInteger(to.getTime()) ||
+      from.getTime() % 60_000 !== 0 || to.getTime() - from.getTime() !== 10 * 60_000 ||
+      to.getTime() > Math.floor(Date.now() / 60_000) * 60_000) throw new NansenClientError('INVALID_REQUEST');
+  return Object.freeze({ ...BASE_USDC_OHLCV_QUERY_IDENTITY, date: Object.freeze({ from: from.toISOString(), to: to.toISOString() }), historical: true });
+}
 function isWethResearchQuery(query: NansenManagedQuery): boolean {
   return Object.entries(WETH_RESEARCH_QUERIES).some(([operation, expected]) => operation === query.operation &&
     expected.operation === query.operation && expected.asset === query.asset && expected.timeframe === query.timeframe &&
@@ -197,7 +249,7 @@ export function usdToMicros(value: number): string | null {
   const output = signed.toString();
   return output.length <= 256 ? output : null;
 }function isRecord(value: unknown): value is Record<string, unknown> { return typeof value === 'object' && value !== null && !Array.isArray(value); }
-function rowAsset(row: TokenScreenerToken | FlowIntelligenceRow | SmartMoneyNetflowToken): 'USDC' | 'WETH' | null {
+function rowAsset(row: QueryData[number]): 'USDC' | 'WETH' | null {
   if (!isRecord(row) || typeof row.token_address !== 'string') return null;
   const address = row.token_address.toLowerCase();
   if (address === BASE_ASSET_ADDRESSES.USDC.toLowerCase()) return 'USDC';
@@ -205,13 +257,20 @@ function rowAsset(row: TokenScreenerToken | FlowIntelligenceRow | SmartMoneyNetf
   return null;
 }
 function metricsFor(query: NansenManagedQuery, data: QueryData): readonly { asset: 'USDC' | 'WETH'; metric: string; value: number | null; rowPresent: boolean }[] {
+  if (query.operation === 'TOKEN_OHLCV') {
+    const candle = data[0] as TokenOhlcvCandle | undefined;
+    return candle ? [{ asset: 'USDC', metric: 'price_usd', value: candle.close, rowPresent: true }] : [];
+  }
   if (query.operation === 'TOKEN_SCREENER') {
-    return (['USDC', 'WETH'] as const).flatMap((asset) => {
+    const assets: readonly ('USDC' | 'WETH')[] = query.asset === 'USDC' ? ['USDC'] : ['USDC', 'WETH'];
+    return assets.flatMap((asset) => {
       const matches = data.filter((item) => rowAsset(item) === asset);
       const row = matches.length === 1 ? matches[0] as TokenScreenerToken : undefined;
+      const rawPrice = row?.price_usd;
+      const positivePrice = typeof rawPrice === 'number' && Number.isFinite(rawPrice) && rawPrice > 0 ? rawPrice : null;
       return [
         { asset, metric: 'market_cap_usd', value: row?.market_cap_usd ?? null, rowPresent: matches.length > 0 },
-        { asset, metric: 'price_usd', value: row?.price_usd ?? null, rowPresent: matches.length > 0 },
+        { asset, metric: 'price_usd', value: positivePrice, rowPresent: matches.length > 0 },
       ];
     });
   }
@@ -249,7 +308,7 @@ function makeSignals(
     }
     const signal = normalizedSignalSchema.parse({
       signalId: randomUUID(), provider: source, endpoint: query.operation, chainId: 8453,
-      asset: metric.asset, metric: metric.metric, observedAt: acquiredAt, fetchedAt, quality, value,
+      asset: metric.asset, metric: metric.metric, observedAt: query.operation === 'TOKEN_OHLCV' ? (data[0] as TokenOhlcvCandle).interval_start : acquiredAt, fetchedAt, timeframe: query.timeframe, quality, value,
       unit: 'usd_micros', provenanceId: provenanceId || cacheKey.slice(0, 64),
     });
     return Object.freeze(signal);
@@ -329,7 +388,11 @@ export class NansenQueryManager {
     if (denied !== null) throw new QueryDispatchDenied();
     const options = { maxPages: query.pageBound };
     if (query.operation === 'TOKEN_SCREENER') {
-      return flatten(await this.config.client.tokenScreener({ timeframe: query.timeframe, per_page: query.perPage }, options));
+      return flatten(await this.config.client.tokenScreener({ asset: query.asset, timeframe: query.timeframe, per_page: query.perPage }, options));
+    }
+    if (query.operation === 'TOKEN_OHLCV') {
+      const result = await this.config.client.tokenOhlcv({ date: query.date }, { maxPages: 1 });
+      return { data: result.candle ? [result.candle] : [], completeness: result.completeness, failure: result.failure, refs: result.pageReferences, unavailable: [], diagnostics: null };
     }
     if (query.operation === 'FLOW_INTELLIGENCE') {
       return flatten(await this.config.client.flowIntelligence({ asset: 'WETH', timeframe: query.timeframe }, options));
@@ -434,8 +497,9 @@ export class NansenQueryManager {
   ): ManagedQueryResult {
     const currentMs = now(this.config.clock);
     const acquiredMs = Date.parse(snapshot.acquiredAt);
-    const age = currentMs - acquiredMs;
-    const stale = requestedStatus === 'stale' || !isWithinSignalFreshness(snapshot.operation, acquiredMs, currentMs);
+    const freshnessMs = snapshot.operation === 'TOKEN_OHLCV' && snapshot.signals.length === 1 ? Date.parse(snapshot.signals[0]!.observedAt) : acquiredMs;
+    const age = currentMs - freshnessMs;
+    const stale = requestedStatus === 'stale' || !isWithinSignalFreshness(snapshot.operation, freshnessMs, currentMs);
     const observations = stale ? maskStale(snapshot) : snapshot.signals;
     const completeness: AdapterCompleteness = stale ? 'incomplete' : snapshot.completeness;
     let status: ManagedQueryStatus = stale ? 'stale' : requestedStatus;

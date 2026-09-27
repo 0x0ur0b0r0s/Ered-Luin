@@ -57,7 +57,8 @@ export interface G3cReadOnlyBaseProvider {
   policyQuoteBundle(input: { readonly intent: TradeIntent; readonly accountSnapshot: G3cEvidenceAttestation }): Promise<BasePolicyQuoteResult>;
   simulate(input: { executionId: string; operationId: string; transaction: G3bUnsignedTransaction; blockNumber?: string; blockHash?: Hex; sourceFinality?: 'unsafe' | 'safe' }): Promise<G3cEvidenceAttestation>;
   estimateFee(input: { executionId: string; operationId: string; transaction: G3bUnsignedTransaction; blockNumber?: string; blockHash?: Hex; sourceFinality?: 'unsafe' | 'safe' }): Promise<G3cEvidenceAttestation>;
-  receipt(input: { executionId: string; operationId: string; transactionHash: Hex; sender: string; nonce: string }): Promise<G3cEvidenceAttestation>;
+  verifyTransaction?(input: { readonly transactionHash: Hex; readonly expectedTransaction: G3bUnsignedTransaction }): Promise<'MATCH' | 'NOT_FOUND' | 'CONFLICT'>;
+  receipt(input: { executionId: string; operationId: string; transactionHash: Hex; sender: string; nonce: string; expectedTransaction?: G3bUnsignedTransaction }): Promise<G3cEvidenceAttestation>;
   close(): void;
 }
 function safeNonceNumber(value: string): number {
@@ -79,6 +80,17 @@ function feeValueWithMargin(valueUsdcMicros: bigint): bigint { return ceilDiv(va
 function txHashBytesLength(tx: G3bUnsignedTransaction): bigint {
   const serialized = serializeG3bUnsignedTransaction(tx);
   return BigInt((serialized.length - 2) / 2 + 100);
+}
+function providerTransactionMatches(actual: unknown, expected: G3bUnsignedTransaction): boolean {
+  if (actual === null || typeof actual !== 'object') return false;
+  const tx = actual as Record<string, unknown>;
+  return tx.type === 'eip1559' && tx.chainId === expected.chainId &&
+    typeof tx.from === 'string' && tx.from.toLowerCase() === expected.from.toLowerCase() &&
+    typeof tx.to === 'string' && tx.to.toLowerCase() === expected.to.toLowerCase() &&
+    typeof tx.input === 'string' && tx.input.toLowerCase() === expected.data.toLowerCase() &&
+    tx.value === BigInt(expected.valueWei) && typeof tx.nonce === 'number' && BigInt(tx.nonce) === BigInt(expected.nonce) &&
+    tx.gas === BigInt(expected.gasLimit) && tx.maxFeePerGas === BigInt(expected.maxFeePerGasWei) &&
+    tx.maxPriorityFeePerGas === BigInt(expected.maxPriorityFeePerGasWei) && Array.isArray(tx.accessList) && tx.accessList.length === 0;
 }
 function transactionDigest(tx: G3bUnsignedTransaction): string {
   return createHash('sha256').update(canonicalJson(tx)).digest('hex');
@@ -464,7 +476,16 @@ export function createBaseReadOnlyProvider(input: { readonly rpcUrl: string; rea
         valueUsdcMicros: safeUnsigned(feeValueWithMargin(quote.amountOut)), includesRevertPath: true,
       });
     },
-    async receipt(query) {
+    async verifyTransaction(query) {
+      await ensureDeployment();
+      try {
+        const actual = await client.getTransaction({ hash: query.transactionHash });
+        return providerTransactionMatches(actual, query.expectedTransaction) ? 'MATCH' : 'CONFLICT';
+      } catch (error) {
+        if (error instanceof Error && error.name === 'TransactionNotFoundError') return 'NOT_FOUND';
+        throw new Error('G3C_TRANSACTION_PROVIDER_UNAVAILABLE');
+      }
+    },    async receipt(query) {
       return recoveryContext.run(true, async () => {
       await ensureDeployment();
       const sender = getAddress(query.sender);
@@ -477,7 +498,8 @@ export function createBaseReadOnlyProvider(input: { readonly rpcUrl: string; rea
         const outcome = pendingNonce > BigInt(query.nonce) ? 'CONFLICT' : 'PENDING';
         return signPayload({ ...receiptPayload({ ...query, sender, outcome }), ...await captureAnchor() });
       }
-      if (tx.hash.toLowerCase() !== query.transactionHash.toLowerCase() || tx.from.toLowerCase() !== sender.toLowerCase() || tx.nonce.toString() !== query.nonce) {
+      if (tx.hash.toLowerCase() !== query.transactionHash.toLowerCase() || tx.from.toLowerCase() !== sender.toLowerCase() || tx.nonce.toString() !== query.nonce ||
+          (query.expectedTransaction !== undefined && !providerTransactionMatches(tx, query.expectedTransaction))) {
         return signPayload({ ...receiptPayload({ ...query, sender, outcome: 'CONFLICT' }), ...await captureAnchor() });
       }
       let receipt;

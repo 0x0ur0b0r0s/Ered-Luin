@@ -14,6 +14,7 @@ export const BASE_ASSET_ADDRESSES = Object.freeze({
 export type BaseEvidenceAsset = keyof typeof BASE_ASSET_ADDRESSES;
 export type TokenScreenerTimeframe = '5m' | '10m' | '1h' | '6h' | '24h' | '7d' | '30d';
 export type FlowIntelligenceTimeframe = '5m' | '1h' | '6h' | '12h' | '1d' | '7d';
+export type TokenOhlcvTimeframe = '1m';
 export type AdapterCompleteness = 'complete' | 'incomplete' | 'unknown';
 export type EvidenceFieldState = 'absent' | 'null' | 'numeric' | 'invalid' | 'ambiguous';
 export type EvidenceFieldName = 'market_cap_usd' | 'price_usd' | 'smart_trader_net_flow_usd' | 'net_flow_1h_usd';
@@ -31,7 +32,14 @@ export interface AdapterEvidenceDiagnostics {
   readonly warningsPresent: boolean;
 }
 
+export interface TokenOhlcvDateRange { readonly from: string; readonly to: string; }
+export interface TokenOhlcvQuery { readonly date: TokenOhlcvDateRange; }
+export interface TokenOhlcvCandle { readonly interval_start: string; readonly close: number; readonly market_cap: Readonly<Record<string, unknown>>; }
+export interface TokenOhlcvAdapterResult { readonly operation: 'TOKEN_OHLCV'; readonly candle: TokenOhlcvCandle | null; readonly completeness: AdapterCompleteness; readonly pageReferences: readonly PageReference[]; readonly failure: AdapterFailure | null; }
+
 export interface TokenScreenerQuery {
+  /** BASE_PAIR preserves the established pair request; USDC selects exact Base USDC only. */
+  readonly asset?: 'BASE_PAIR' | 'USDC';
   readonly timeframe?: TokenScreenerTimeframe;
   readonly per_page?: number;
 }
@@ -113,7 +121,7 @@ export interface AdapterFailure {
 }
 
 export interface AdapterResult<T> {
-  readonly operation: 'TOKEN_SCREENER' | 'FLOW_INTELLIGENCE' | 'SMART_MONEY_NETFLOW';
+  readonly operation: 'TOKEN_SCREENER' | 'FLOW_INTELLIGENCE' | 'SMART_MONEY_NETFLOW' | 'TOKEN_OHLCV';
   readonly data: readonly T[];
   readonly warnings: readonly string[];
   readonly warningsAvailable: boolean;
@@ -135,6 +143,7 @@ export interface NansenClient {
     query: FlowIntelligenceQuery,
     options?: NansenCallOptions,
   ) => Promise<AdapterResult<FlowIntelligenceRow>>;
+  readonly tokenOhlcv: (query: TokenOhlcvQuery, options?: NansenCallOptions) => Promise<TokenOhlcvAdapterResult>;
   readonly smartMoneyNetflow: (
     query?: SmartMoneyNetflowQuery,
     options?: NansenCallOptions,
@@ -271,8 +280,9 @@ function evidenceDiagnostics(
   finalPage: boolean | null,
   warningsFieldPresent: boolean,
   warningsPresent: boolean,
+  requestedAssetsOverride?: readonly BaseEvidenceAsset[],
 ): AdapterEvidenceDiagnostics {
-  const requestedAssets: readonly BaseEvidenceAsset[] = operation === 'FLOW_INTELLIGENCE' ? ['WETH'] : ['USDC', 'WETH'];
+  const requestedAssets: readonly BaseEvidenceAsset[] = requestedAssetsOverride ?? (operation === 'FLOW_INTELLIGENCE' ? ['WETH'] : ['USDC', 'WETH']);
   const fields: readonly EvidenceFieldName[] = operation === 'TOKEN_SCREENER'
     ? ['market_cap_usd', 'price_usd']
     : operation === 'FLOW_INTELLIGENCE' ? ['smart_trader_net_flow_usd'] : ['net_flow_1h_usd'];
@@ -348,7 +358,7 @@ function parsePagedRoot(
   };
 }
 
-function parseTokenScreener(value: unknown, pageNumber: number, perPage: number): ParsedPage<TokenScreenerToken> {
+function parseTokenScreener(value: unknown, pageNumber: number, perPage: number, requestedAsset: 'BASE_PAIR' | 'USDC'): ParsedPage<TokenScreenerToken> {
   const parsed = parsePagedRoot(value, pageNumber, ['data', 'pagination']);
   if ((parsed.root.data as unknown[]).length > perPage) throw new TypeError('Too many response rows');
   const unavailable: string[] = parsed.unknown ? ['unrecognized_provider_fields'] : [];
@@ -363,6 +373,8 @@ function parseTokenScreener(value: unknown, pageNumber: number, perPage: number)
       typeof item.token_symbol !== 'string' ||
       item.token_symbol.length > 64
     ) throw new TypeError('Invalid token identity');
+    const returnedAsset = evidenceAsset(item.token_address);
+    if (requestedAsset === 'USDC' && returnedAsset !== 'USDC') throw new TypeError('Unexpected token identity');
     if (isUnknownSet(item, known)) unavailable.push('unrecognized_token_fields');
     const rowUnavailable: string[] = [];
     const output: TokenScreenerToken = {
@@ -527,6 +539,7 @@ async function pageResults<T>(
   operation: AdapterResult<T>['operation'],
   maxPages: number,
   fetchPage: PageFetcher<T>,
+  requestedAssets?: readonly BaseEvidenceAsset[],
 ): Promise<AdapterResult<T>> {
   const data: T[] = [];
   const warnings: string[] = [];
@@ -600,7 +613,7 @@ async function pageResults<T>(
     pageReferences: Object.freeze(references),
     unavailableFields: Object.freeze([...new Set(unavailable)].slice(0, 64)),
     diagnostics: failure === null && pagesRead > 0
-      ? evidenceDiagnostics(operation, structuralRows, pagesRead, finalPage, warningsAvailable, warnings.length > 0)
+      ? evidenceDiagnostics(operation, structuralRows, pagesRead, finalPage, warningsAvailable, warnings.length > 0, requestedAssets)
       : null,
     failure,
   });
@@ -611,6 +624,49 @@ function validateAsset(value: unknown): BaseEvidenceAsset {
   return value;
 }
 
+function validateOhlcvWindow(date: TokenOhlcvDateRange): { readonly fromMs: number; readonly toMs: number } {
+  const fromMs = Date.parse(date.from);
+  const toMs = Date.parse(date.to);
+  const isoZoned = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:00(?:\.0+)?(?:Z|[+-]\d{2}:\d{2})$/u;
+  if (!isoZoned.test(date.from) || !isoZoned.test(date.to) || !Number.isSafeInteger(fromMs) || !Number.isSafeInteger(toMs) ||
+      fromMs % 60_000 !== 0 || toMs % 60_000 !== 0 || toMs - fromMs !== 10 * 60_000 ||
+      toMs > Math.floor(Date.now() / 60_000) * 60_000) throw new NansenClientError('INVALID_REQUEST');
+  return Object.freeze({ fromMs, toMs });
+}
+function parseTokenOhlcv(value: unknown, query: TokenOhlcvQuery): TokenOhlcvCandle | null {
+  const { fromMs, toMs } = validateOhlcvWindow(query.date);
+  if (!isRecord(value) || Object.keys(value).some((key) => !['chain', 'token_address', 'timeframe', 'data', 'truncated', 'truncation_note'].includes(key)) ||
+      value.chain !== 'base' || typeof value.token_address !== 'string' ||
+      value.token_address.toLowerCase() !== BASE_ASSET_ADDRESSES.USDC.toLowerCase() || value.timeframe !== '1m' ||
+      !Array.isArray(value.data) || value.data.length > 50_000) throw new NansenClientError('INVALID_RESPONSE');
+  const truncated = value.truncated === undefined ? false : value.truncated;
+  if (typeof truncated !== 'boolean' || truncated) throw new NansenClientError('INVALID_RESPONSE');
+  if (value.truncation_note !== undefined && value.truncation_note !== null &&
+      (typeof value.truncation_note !== 'string' || value.truncation_note.length > 512 || value.truncation_note.length > 0)) {
+    throw new NansenClientError('INVALID_RESPONSE');
+  }
+
+  const intervals = new Set<number>();
+  let newest: TokenOhlcvCandle | null = null;
+  let newestMs = -1;
+  for (const item of value.data) {
+    if (!isRecord(item) || typeof item.interval_start !== 'string' || typeof item.close !== 'number' ||
+        !Number.isFinite(item.close) || item.close <= 0 || !isRecord(item.market_cap)) {
+      throw new NansenClientError('INVALID_RESPONSE');
+    }
+    const intervalMs = Date.parse(item.interval_start);
+    if (!Number.isSafeInteger(intervalMs) || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:00(?:\.0+)?(?:Z|[+-]\d{2}:\d{2})$/u.test(item.interval_start) || intervalMs % 60_000 !== 0 ||
+        intervalMs < fromMs || intervalMs >= toMs || intervalMs + 60_000 > toMs || intervals.has(intervalMs)) {
+      throw new NansenClientError('INVALID_RESPONSE');
+    }
+    intervals.add(intervalMs);
+    if (intervalMs > newestMs) {
+      newestMs = intervalMs;
+      newest = Object.freeze({ interval_start: new Date(intervalMs).toISOString(), close: item.close, market_cap: Object.freeze({ ...item.market_cap }) });
+    }
+  }
+  return newest;
+}
 export function buildNansenAdapters(
   guarded: { readonly post: GuardedPost; readonly maxPages: number },
 ): NansenClient {
@@ -632,13 +688,16 @@ export function buildNansenAdapters(
   ): Promise<AdapterResult<TokenScreenerToken>> => {
     if (query !== undefined && !isRecord(query)) throw new NansenClientError('INVALID_REQUEST');
     const record = (query ?? {}) as Record<string, unknown>;
-    rejectUnknownKeys(record, ['timeframe', 'per_page']);
+    rejectUnknownKeys(record, ['asset', 'timeframe', 'per_page']);
+    const asset = record.asset ?? 'BASE_PAIR';
+    if (asset !== 'BASE_PAIR' && asset !== 'USDC') throw new NansenClientError('INVALID_REQUEST');
     const timeframe = record.timeframe ?? '1h';
     if (typeof timeframe !== 'string' || !SCREENER_TIMEFRAMES.has(timeframe as TokenScreenerTimeframe)) {
       throw new NansenClientError('INVALID_REQUEST');
     }
-    const perPage = normalizePageSize(query, ['timeframe', 'per_page']);
+    const perPage = normalizePageSize(query, ['asset', 'timeframe', 'per_page']);
     const maxPages = pageBound(options, guarded.maxPages);
+    const requestedAssets: readonly BaseEvidenceAsset[] = asset === 'USDC' ? ['USDC'] : ['USDC', 'WETH'];
     return pageResults('TOKEN_SCREENER', maxPages, async (page) => {
       const parsed = await guarded.post(
         'TOKEN_SCREENER',
@@ -646,13 +705,17 @@ export function buildNansenAdapters(
           chains: ['base'],
           timeframe,
           pagination: { page, per_page: perPage },
-          filters: {
+          filters: asset === 'USDC' ? {
+            token_address: BASE_ASSET_ADDRESSES.USDC,
+            include_stablecoins: true,
+            trader_type: 'all',
+          } : {
             token_address: [BASE_ASSET_ADDRESSES.USDC, BASE_ASSET_ADDRESSES.WETH],
             include_stablecoins: true,
             include_native_tokens: true,
           },
         },
-        (value) => parseTokenScreener(value, page, perPage),
+        (value) => parseTokenScreener(value, page, perPage, asset),
         options,
       );
       return {
@@ -664,7 +727,7 @@ export function buildNansenAdapters(
           chargedCredits: parsed.chargedCredits,
         },
       };
-    });
+    }, requestedAssets);
   };
 
   const flowIntelligence = async (
@@ -706,6 +769,40 @@ export function buildNansenAdapters(
     }));
   };
 
+  const tokenOhlcv = async (
+    query: TokenOhlcvQuery,
+    options?: NansenCallOptions,
+  ): Promise<TokenOhlcvAdapterResult> => {
+    if (!isRecord(query) || Object.keys(query).length !== 1 || !isRecord(query.date) ||
+        Object.keys(query.date).length !== 2 || typeof query.date.from !== 'string' || typeof query.date.to !== 'string') {
+      throw new NansenClientError('INVALID_REQUEST');
+    }
+    pageBound(options, 1);
+    validateOhlcvWindow(query.date);
+    try {
+      const parsed = await guarded.post(
+        'TOKEN_OHLCV',
+        { chain: 'base', token_address: BASE_ASSET_ADDRESSES.USDC, timeframe: '1m', date: { from: query.date.from, to: query.date.to } },
+        (value) => parseTokenOhlcv(value, query),
+        options,
+      );
+      return Object.freeze({
+        operation: 'TOKEN_OHLCV', candle: parsed.value, completeness: 'complete', failure: null,
+        pageReferences: Object.freeze([{ attemptId: parsed.attemptId, status: parsed.status, providerRequestId: parsed.providerRequestId,
+          chargedCredits: parsed.chargedCredits, page: 1, received: true }]),
+      });
+    } catch (error) {
+      const safe = clientError(error);
+      const refs: PageReference[] = safe.attemptId === null ? [] : [Object.freeze({
+        attemptId: safe.attemptId, status: safe.status, providerRequestId: safe.providerRequestId,
+        chargedCredits: safe.chargedCredits, page: 1, received: false,
+      })];
+      return Object.freeze({
+        operation: 'TOKEN_OHLCV', candle: null, completeness: 'incomplete', failure: failureFor(safe),
+        pageReferences: Object.freeze(refs),
+      });
+    }
+  };
   const smartMoneyNetflow = async (
     query?: SmartMoneyNetflowQuery,
     options?: NansenCallOptions,
@@ -739,5 +836,5 @@ export function buildNansenAdapters(
     });
   };
 
-  return Object.freeze({ tokenScreener, flowIntelligence, smartMoneyNetflow });
+  return Object.freeze({ tokenScreener, flowIntelligence, tokenOhlcv, smartMoneyNetflow });
 }

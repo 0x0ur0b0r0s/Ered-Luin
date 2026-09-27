@@ -9,6 +9,7 @@ export type {
   NansenHttpRequest,
   NansenHttpResponse,
   NansenHttpTransport,
+  NansenRawResponseObservation,
 } from './client-core.js';
 export { BASE_ASSET_ADDRESSES } from './adapters.js';
 export type {
@@ -25,13 +26,14 @@ export type {
   SmartMoneyNetflowToken,
   TokenScreenerQuery,
   TokenScreenerTimeframe,
-  TokenScreenerToken,
+  TokenScreenerToken, TokenOhlcvAdapterResult, TokenOhlcvCandle, TokenOhlcvDateRange, TokenOhlcvQuery, TokenOhlcvTimeframe,
 } from './adapters.js';
 
 const clientProvenance = new WeakMap<NansenClient, 'nansen' | 'synthetic'>();
 
 export function createNansenClient(options: NansenClientOptions): NansenClient {
-  const guarded = createGuardedPost(options);
+  const { attemptIdFactory, ...guardedOptions } = options;
+  const guarded = createGuardedPost(guardedOptions, attemptIdFactory);
   const client = buildNansenAdapters(guarded);
   clientProvenance.set(client, guarded.provenance);
   return client;

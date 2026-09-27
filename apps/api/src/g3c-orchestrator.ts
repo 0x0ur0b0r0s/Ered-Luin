@@ -82,6 +82,7 @@ export async function simulateBaseG3cOperation(input: {
 export async function prepareBaseG3cOperation(input: {
   readonly store: G3cExecutionStore; readonly provider: G3cReadOnlyBaseProvider; readonly executionId: string;
   readonly operationId: string; readonly sessionId: string; readonly kind: 'APPROVAL' | 'SWAP'; readonly reason: string;
+  readonly submissionMode?: 'APPLICATION_SIGNER' | 'BROWSER_WALLET';
 }): Promise<G3cWorkflowWriteResult> {
   input.store.assertIntentFresh(input.executionId);
   await input.provider.verifyDeployment();
@@ -114,8 +115,11 @@ export async function prepareBaseG3cOperation(input: {
   simulationFields(simulation);
   const fee = await input.provider.estimateFee({ executionId: input.executionId, operationId: input.operationId,
     transaction, blockNumber: snapshot.blockNumber, blockHash: snapshot.blockHash as `0x${string}`, sourceFinality: 'unsafe'});
-  return input.store.prepareOperation({ executionId: input.executionId, operationId: input.operationId, sessionId: input.sessionId,
-    kind: input.kind, unsignedTransaction: transaction, accountSnapshot: refreshed, quote, simulation, fee, reason: input.reason });
+  const workflowInput = { executionId: input.executionId, operationId: input.operationId, sessionId: input.sessionId,
+    kind: input.kind, unsignedTransaction: transaction, accountSnapshot: refreshed, quote, simulation, fee, reason: input.reason } as const;
+  return input.submissionMode === 'BROWSER_WALLET'
+    ? input.store.prepareBrowserOperation(workflowInput)
+    : input.store.prepareOperation(workflowInput);
 }
 export async function signBaseG3cOperation(input: {
   readonly store: G3cExecutionStore; readonly provider: G3cReadOnlyBaseProvider; readonly operationId: string;
@@ -141,7 +145,8 @@ export async function reconcileBaseG3cOperation(input: {
     const workflow = input.store.getWorkflow(input.operationId);
     if (!workflow.transactionHash) throw new Error('G3C_TRANSACTION_HASH_MISSING');
     const receipt = await input.provider.receipt({ executionId: workflow.executionId, operationId: workflow.operationId,
-      transactionHash: workflow.transactionHash as Hex, sender: workflow.unsignedTransaction.from, nonce: workflow.unsignedTransaction.nonce });
+      transactionHash: workflow.transactionHash as Hex, sender: workflow.unsignedTransaction.from, nonce: workflow.unsignedTransaction.nonce,
+      expectedTransaction: workflow.unsignedTransaction });
     const payload = receipt.payload;
     if (payload.kind !== 'RECEIPT' || !['CONFIRMED','REVERTED'].includes(payload.outcome) || payload.finality !== 'finalized' || payload.canonical !== true) {
       return input.store.recordReceipt(workflow.operationId, receipt, null, input.reason);

@@ -15,6 +15,7 @@ import {
 import { summarizeNansenHistory } from './history-summary.mjs';
 import { createD2lResearchHooks } from '../d2l/research-session.mjs';
 import { summarizeWethResearchHistory } from '../d2l/research-summary.mjs';
+import { readAllocationRetirement } from './allocation-retirement.mjs';
 
 const ROOT = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const FAIL_REASONS = new Set([
@@ -34,7 +35,7 @@ const SAFE_ERRORS = new Set([
   'LEDGER_RECONCILIATION_REQUIRED', 'LEDGER_REMAINING_BELOW_CREDIT_CAP', 'RESUME_NOT_ALLOWED',
   'RESUME_REQUIRES_RECONCILIATION', 'RESUME_COUNTERS_REQUIRED', 'RESUME_COUNTERS_INVALID', 'RESUME_PROFILE_UPGRADE_REQUIRED', 'RESUME_SUCCESS_TARGET_INVALID',
   'RUN_DEADLINE_EXPIRED', 'RUN_ALREADY_ACTIVE', 'STOP_REQUEST_INVALID', 'STOP_REQUEST_UNAVAILABLE',
-  'STATUS_COMMAND_INVALID', 'SUMMARY_CONFIG_REQUIRED', 'D2H_FAILED_SAFE', 'SUMMARY_INPUT_INVALID', 'SUMMARY_CLOCK_INVALID',
+  'STATUS_COMMAND_INVALID', 'RUN_BUDGET_RETIRED', 'ALLOCATION_RETIREMENT_INVALID', 'ALLOCATION_RETIREMENT_IDENTITY_MISMATCH', 'SUMMARY_CONFIG_REQUIRED', 'D2H_FAILED_SAFE', 'SUMMARY_INPUT_INVALID', 'SUMMARY_CLOCK_INVALID',
 ]);
 const OFF_GATES = [
   'LIVE_EXECUTION_ENABLED', 'D2_BASE_READS_ENABLED', 'D2_DEPLOYMENT_REVIEWED', 'ALCHEMY_BUDGET_VERIFIED',
@@ -211,6 +212,7 @@ async function startOrResume(command, options) {
   if (typeof manifestPath !== 'string') throw new Error('MANIFEST_PATH_INVALID');
   const configPath = requireConfigPath(options.config);
   const environment = readD2cExternalConfig(configPath);
+  const retirementRoot = process.env.LOCALAPPDATA ? resolve(process.env.LOCALAPPDATA, 'Ered-Luin') : null;
   let existing = null;
   if (command === 'start') assertNewManifestLocation(manifestPath);
   else {
@@ -223,6 +225,8 @@ async function startOrResume(command, options) {
   }
   const creditCap = command === 'start' ? positiveInt(options.creditCap) : existing.creditCap;
   assertExternalCollectionGates(environment, creditCap);
+  if (!retirementRoot) throw new Error('ALLOCATION_RETIREMENT_INVALID');
+  if (readAllocationRetirement(retirementRoot, environment.NANSEN_LEDGER_BUDGET_ID, environment.NANSEN_LEDGER_PATH)) throw new Error('RUN_BUDGET_RETIRED');
   const apiKey = process.env.NANSEN_API_KEY;
   if (typeof apiKey !== 'string' || apiKey.length === 0) throw new Error('NANSEN_CREDENTIAL_UNAVAILABLE');
   const runId = existing?.runId ?? undefined;
@@ -271,7 +275,7 @@ async function startOrResume(command, options) {
       : manifestBounds(manifest);
     const persist = () => writeRunManifest(manifestPath, ROOT, manifest);
     const hookOptions = { bounds: resolvedBounds, manifest, getLedgerSnapshot: () => ledger.getSnapshot(),
-      costs: NANSEN_OPERATION_COSTS, persist, stopRequested: () => readStopRequest(markerPath(manifestPath), manifest.runId) !== 'NONE' };
+      costs: NANSEN_OPERATION_COSTS, persist, stopRequested: () => Boolean(readAllocationRetirement(retirementRoot, environment.NANSEN_LEDGER_BUDGET_ID, environment.NANSEN_LEDGER_PATH)) || readStopRequest(markerPath(manifestPath), manifest.runId) !== 'NONE' };
     const hooks = isResearchProfile(options.profile) ? createD2lResearchHooks(hookOptions) : createD2hRunHooks(hookOptions);
     const client = createNansenClient({ ledger, enabled: true, apiKey, maxPages: 1, timeoutMs: 8_000, maxResponseBytes: 1_048_576 });
     const manager = createNansenQueryManager({ client, store, enabled: true, maxPageBound: 1, maxRetryBound: 0, beforeDispatch: hooks.beforeDispatch,

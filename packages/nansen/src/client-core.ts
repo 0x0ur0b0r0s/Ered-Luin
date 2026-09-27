@@ -11,6 +11,7 @@ export const NANSEN_ENDPOINT_PATHS = Object.freeze({
   TOKEN_SCREENER: '/api/v1/token-screener',
   FLOW_INTELLIGENCE: '/api/v1/tgm/flow-intelligence',
   SMART_MONEY_NETFLOW: '/api/v1/smart-money/netflow',
+  TOKEN_OHLCV: '/api/v1/tgm/token-ohlcv',
 } as const);
 
 const DEFAULT_TIMEOUT_MS = 8_000;
@@ -110,13 +111,33 @@ export interface NansenCallOptions {
 }
 
 export interface NansenClientOptions {
+  /** Optional stable identity for a caller-managed single bounded attempt. */
+  readonly attemptIdFactory?: () => string;
   readonly ledger: NansenCreditLedger;
   readonly enabled?: boolean;
   readonly apiKey?: string;
   readonly transport?: NansenHttpTransport;
+  /** Opt-in observer at the guarded response boundary, before JSON parsing. */
+  readonly onRawResponse?: (observation: NansenRawResponseObservation) => void;
   readonly timeoutMs?: number;
   readonly maxResponseBytes?: number;
   readonly maxPages?: number;
+}
+
+export interface NansenRawResponseObservation {
+  readonly attemptId: string;
+  readonly operation: NansenOperation;
+  readonly requestBodySha256: string;
+  readonly capturedAt: string;
+  readonly status: number;
+  readonly providerRequestId: string | null;
+  readonly chargedCredits: number | null;
+  readonly contentType: string | null;
+  readonly retryAfterMs: number | null;
+  readonly byteLength: number;
+  readonly sha256: string;
+  /** A defensive copy of the single bounded body read by the production transport. */
+  readonly body: Uint8Array;
 }
 
 export interface NansenAttemptMetadata {
@@ -143,6 +164,7 @@ export interface NormalizedClientOptions {
   readonly apiKey: string | null;
   readonly transport: NansenHttpTransport;
   readonly provenance: 'nansen' | 'synthetic';
+  readonly onRawResponse: ((observation: NansenRawResponseObservation) => void) | undefined;
   readonly timeoutMs: number;
   readonly maxResponseBytes: number;
   readonly maxPages: number;
@@ -168,7 +190,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function normalizeOptions(value: unknown): NormalizedClientOptions {
   if (!isRecord(value)) throw new NansenClientError('INVALID_CONFIGURATION');
-  const allowed = ['ledger', 'enabled', 'apiKey', 'transport', 'timeoutMs', 'maxResponseBytes', 'maxPages'];
+  const allowed = ['ledger', 'enabled', 'apiKey', 'transport', 'onRawResponse', 'timeoutMs', 'maxResponseBytes', 'maxPages'];
   if (Object.keys(value).some((key) => !allowed.includes(key))) {
     throw new NansenClientError('INVALID_CONFIGURATION');
   }
@@ -189,6 +211,8 @@ function normalizeOptions(value: unknown): NormalizedClientOptions {
   const providedTransport = value.transport;
   if (providedTransport !== undefined && typeof providedTransport !== 'function') throw new NansenClientError('INVALID_CONFIGURATION');
   const transport = providedTransport === undefined ? fetchTransport : providedTransport as NansenHttpTransport;
+  const onRawResponse = value.onRawResponse;
+  if (onRawResponse !== undefined && typeof onRawResponse !== 'function') throw new NansenClientError('INVALID_CONFIGURATION');
 
   const timeoutMs = value.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   if (
@@ -218,6 +242,7 @@ function normalizeOptions(value: unknown): NormalizedClientOptions {
     apiKey: typeof apiKey === 'string' ? apiKey : null,
     transport,
     provenance: providedTransport === undefined ? 'nansen' : 'synthetic',
+    onRawResponse: onRawResponse as ((observation: NansenRawResponseObservation) => void) | undefined,
     timeoutMs,
     maxResponseBytes,
     maxPages,
@@ -270,6 +295,23 @@ function safeProviderRequestId(headers: Readonly<Record<string, string>>): strin
   return value !== null && REQUEST_ID.test(value) ? value : null;
 }
 
+function safeContentType(headers: Readonly<Record<string, string>>): string | null {
+  const value = safeHeader(headers, 'content-type');
+  return value !== null && value.length <= 128 &&
+    /^[A-Za-z0-9!#$&^_.+-]+\/[A-Za-z0-9!#$&^_.+-]+(?:\s*;\s*charset=[A-Za-z0-9._-]+)?$/iu.test(value)
+    ? value
+    : null;
+}
+
+function safeRetryAfterMs(headers: Readonly<Record<string, string>>, nowMs = Date.now()): number | null {
+  const value = safeHeader(headers, 'retry-after');
+  if (value === null) return null;
+  let delayMs: number;
+  if (/^(0|[1-9][0-9]*)$/u.test(value)) { const seconds = Number(value); if (!Number.isSafeInteger(seconds)) return null; delayMs = seconds * 1_000; }
+  else { const timestamp = Date.parse(value); if (!Number.isSafeInteger(timestamp)) return null; delayMs = Math.max(0, timestamp - nowMs); }
+  return Number.isSafeInteger(delayMs) ? Math.min(24 * 60 * 60 * 1_000, delayMs) : null;
+}
+
 function documentedChargedCredits(headers: Readonly<Record<string, string>>): number | null {
   const value = safeHeader(headers, 'x-nansen-credits-used');
   if (value === null || !/^(0|[1-9][0-9]*)$/u.test(value)) return null;
@@ -283,10 +325,12 @@ function validStatus(status: unknown): status is number {
 
 function knownResponseHeaders(response: Response): Readonly<Record<string, string>> {
   const headers: Record<string, string> = {};
-  for (const name of ['x-request-id', 'x-nansen-credits-used']) {
+  for (const name of ['x-request-id', 'x-nansen-credits-used', 'retry-after']) {
     const value = response.headers.get(name);
     if (value !== null) headers[name] = value;
   }
+  const contentType = response.headers.get('content-type');
+  if (contentType !== null) headers['content-type'] = contentType;
   return Object.freeze(headers);
 }
 async function readBoundedBody(response: Response, maxBytes: number): Promise<Uint8Array> {
@@ -572,12 +616,41 @@ export function createGuardedPost(
           providerRequestId,
           chargedCredits,
         });
+        if (config.provenance === 'nansen' && config.onRawResponse !== undefined) {
+          try { config.onRawResponse(Object.freeze({ attemptId, operation,
+            requestBodySha256: createHash('sha256').update(jsonBody, 'utf8').digest('hex'), capturedAt: new Date().toISOString(),
+            status: responseStatus, providerRequestId, chargedCredits, contentType: safeContentType(responseHeaders),
+            retryAfterMs: safeRetryAfterMs(responseHeaders), byteLength: 0, sha256: createHash('sha256').update(new Uint8Array()).digest('hex'), body: new Uint8Array() })); }
+          catch { /* Metadata observers cannot change durable request accounting. */ }
+        }
         throw new NansenClientError('HTTP_ERROR', {
           attemptId,
           status: responseStatus,
           providerRequestId,
           chargedCredits,
         });
+      }
+
+      if (config.provenance === 'nansen' && config.onRawResponse !== undefined) {
+        try {
+          const capturedBody = new Uint8Array(response.body);
+          config.onRawResponse(Object.freeze({
+            attemptId,
+            operation,
+            requestBodySha256: createHash('sha256').update(jsonBody, 'utf8').digest('hex'),
+            capturedAt: new Date().toISOString(),
+            status: responseStatus,
+            providerRequestId,
+            chargedCredits,
+            contentType: safeContentType(responseHeaders),
+            retryAfterMs: safeRetryAfterMs(responseHeaders),
+            byteLength: capturedBody.byteLength,
+            sha256: createHash('sha256').update(capturedBody).digest('hex'),
+            body: capturedBody,
+          }));
+        } catch {
+          // Capture persistence is diagnostic-only; the charged response still parses and settles.
+        }
       }
 
       let value: T;

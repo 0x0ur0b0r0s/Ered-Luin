@@ -135,6 +135,8 @@ export const g3cWorkflowStatusSchema = z.enum([
 export const g3cWorkflowSchema = z.object({
   version: z.literal(1), executionId: UUID, intentId: UUID, decisionId: UUID, reservationId: UUID, operationId: UUID, sessionId: UUID,
   kind: z.enum(['APPROVAL', 'SWAP']), status: g3cWorkflowStatusSchema,
+  submissionMode: z.enum(['APPLICATION_SIGNER', 'BROWSER_WALLET']).default('APPLICATION_SIGNER'),
+  browserStage: z.enum(['READY', 'SUBMISSION_UNCERTAIN', 'SUBMITTED', 'RECONCILIATION_REQUIRED', 'CONFIRMED', 'REVERTED', 'REJECTED']).nullable().default(null),
   accountVersion: z.number().int().positive().safe(), accountSnapshot: g3cEvidenceAttestationSchema, signingAccountSnapshot: g3cEvidenceAttestationSchema.nullable(),
   quote: g3cEvidenceAttestationSchema.nullable(), simulation: g3cEvidenceAttestationSchema,
   fee: g3cEvidenceAttestationSchema, unsignedTransaction: g3bUnsignedTransactionSchema,
@@ -148,11 +150,28 @@ export const g3cWorkflowSchema = z.object({
   failureReason: z.string().min(1).max(240).nullable(), createdAt: ISO_TIMESTAMP, updatedAt: ISO_TIMESTAMP,
   revision: z.number().int().positive().safe(),
 }).strict().superRefine((value, ctx) => {
-  const claimed = ['SIGNING_CLAIMED', 'SIGNED_OUTBOX', 'SUBMISSION_UNCERTAIN', 'SUBMITTED', 'CONFIRMED', 'REVERTED', 'RECONCILIATION_REQUIRED'].includes(value.status);
-  const outbox = ['SIGNED_OUTBOX', 'SUBMISSION_UNCERTAIN', 'SUBMITTED', 'CONFIRMED', 'REVERTED', 'RECONCILIATION_REQUIRED'].includes(value.status);
+  const browserStatus = value.submissionMode === 'BROWSER_WALLET';
+  const claimed = !browserStatus && ['SIGNING_CLAIMED', 'SIGNED_OUTBOX', 'SUBMISSION_UNCERTAIN', 'SUBMITTED', 'CONFIRMED', 'REVERTED', 'RECONCILIATION_REQUIRED'].includes(value.status);
+  const outbox = !browserStatus && ['SIGNED_OUTBOX', 'SUBMISSION_UNCERTAIN', 'SUBMITTED', 'CONFIRMED', 'REVERTED', 'RECONCILIATION_REQUIRED'].includes(value.status);
   const settled = value.status === 'CONFIRMED' || value.status === 'REVERTED';
+  const browserStatusForStage = {
+    READY: 'AUTHORIZED', SUBMISSION_UNCERTAIN: 'SUBMISSION_UNCERTAIN', SUBMITTED: 'SUBMITTED',
+    RECONCILIATION_REQUIRED: 'RECONCILIATION_REQUIRED', CONFIRMED: 'CONFIRMED', REVERTED: 'REVERTED', REJECTED: 'CANCELLED',
+  } as const;
+  if (browserStatus !== (value.browserStage !== null) ||
+      (browserStatus && browserStatusForStage[value.browserStage!] !== value.status)) {
+    ctx.addIssue({ code: 'custom', path: ['browserStage'], message: 'Browser wallet stage must match its distinct execution mode and workflow status' });
+  }
+  if (browserStatus && (value.signingClaimId !== null || value.claimedAt !== null || value.signingAccountSnapshot !== null ||
+      value.signedBytesHex !== null || value.signedBytesDigest !== null ||
+      (['READY', 'REJECTED'].includes(value.browserStage!) && value.transactionHash !== null) ||
+      (['SUBMITTED', 'CONFIRMED', 'REVERTED'].includes(value.browserStage!) && value.transactionHash === null))) {
+    ctx.addIssue({ code: 'custom', path: ['submissionMode'], message: 'Browser wallet workflow cannot claim the local signer outbox and requires a hash after submission' });
+  }
   if (claimed !== Boolean(value.signingClaimId && value.claimedAt && value.signingAccountSnapshot)) ctx.addIssue({ code: 'custom', path: ['signingClaimId'], message: 'Signing claim does not match workflow state' });
-  if (outbox !== Boolean(value.signedBytesHex && value.signedBytesDigest && value.transactionHash)) ctx.addIssue({ code: 'custom', path: ['signedBytesHex'], message: 'Signed outbox does not match workflow state' });
+  if (!browserStatus && outbox !== Boolean(value.signedBytesHex && value.signedBytesDigest && value.transactionHash)) ctx.addIssue({ code: 'custom', path: ['signedBytesHex'], message: 'Signed outbox does not match workflow state' });
+  if (browserStatus && value.status !== 'CANCELLED' && value.status !== 'AUTHORIZED' && value.transactionHash !== null &&
+      !/^0x[0-9a-fA-F]{64}$/u.test(value.transactionHash)) ctx.addIssue({ code: 'custom', path: ['transactionHash'], message: 'Browser submission hash is invalid' });
   if (settled && (!value.receipt || !value.settlementSnapshot)) ctx.addIssue({ code: 'custom', path: ['receipt'], message: 'Final settlement requires receipt and reconciled account snapshot' });
   if (!settled && value.settlementSnapshot) ctx.addIssue({ code: 'custom', path: ['settlementSnapshot'], message: 'Only terminal workflows retain a settlement snapshot' });
   if (settled && value.status === 'CONFIRMED' && value.receipt?.payload.kind === 'RECEIPT' && value.receipt.payload.outcome !== 'CONFIRMED') ctx.addIssue({ code: 'custom', path: ['receipt'], message: 'Confirmed status requires a successful receipt' });

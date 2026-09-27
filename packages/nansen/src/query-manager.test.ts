@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { normalizedSignalSchema } from '@ered-luin/contracts';
 import {
-  BASE_ASSET_ADDRESSES, NANSEN_COST_PROFILE_VERSION, buildG1DEvidencePacket, createNansenClient, createNansenQueryManager,
+  BASE_ASSET_ADDRESSES, BASE_USDC_OHLCV_PRICE_CACHE_KEY, BASE_USDC_PRICE_CACHE_KEY, BASE_USDC_PRICE_QUERY, NANSEN_COST_PROFILE_VERSION, buildG1DEvidencePacket, createBaseUsdcOhlcvPriceQuery, createHistoricalBaseUsdcOhlcvQuery, createNansenClient, createNansenQueryManager,
   estimateWorstCaseCredits, initializeCreditLedger, initializeNansenObservationStore,
   isWithinSignalFreshness, openCreditLedger, openNansenObservationStore,
   projectScheduledCollection, usdToMicros, type LedgerOptions, type ManagedQueryDiagnostic, type NansenCreditLedger,
@@ -415,3 +415,202 @@ describe('G1c query management and observation persistence', () => {
   });});
 
 function cryptoRandomId(): string { return globalThis.crypto.randomUUID(); }
+
+
+describe('managed Base USDC price identity', () => {
+  it('keeps exact-USDC request/cache evidence separate from the established Base pair', async () => {
+    const usdcOnly = {
+      data: [{ chain: 'base', token_address: BASE_ASSET_ADDRESSES.USDC, token_symbol: 'USDC', price_usd: 1.0001, market_cap_usd: 10_000 }],
+      pagination: { page: 1, per_page: 100, is_last_page: true },
+    };
+    const fake = transportQueue([response(screener), response(usdcOnly)]);
+    const test = env(fake.transport);
+    const pair = await test.manager.query(SCREEN_QUERY);
+    const usdc = await test.manager.query(BASE_USDC_PRICE_QUERY);
+    const repeatedUsdc = await test.manager.query(BASE_USDC_PRICE_QUERY);
+
+    expect(BASE_USDC_PRICE_QUERY).toMatchObject({ operation: 'TOKEN_SCREENER', asset: 'USDC', timeframe: '1h', pageBound: 1, retryBound: 0, perPage: 100 });
+    expect(usdc.cacheKey).not.toBe(BASE_USDC_PRICE_CACHE_KEY);
+    expect(pair.cacheKey).not.toBe(usdc.cacheKey);
+    expect(fake.requests).toHaveLength(2);
+    expect(JSON.parse(fake.requests[1]!.body)).toEqual({
+      chains: ['base'], timeframe: '1h', pagination: { page: 1, per_page: 100 },
+      filters: { token_address: BASE_ASSET_ADDRESSES.USDC, include_stablecoins: true, trader_type: 'all' },
+    });
+    expect(usdc.observations.map(({ asset, metric }) => [asset, metric])).toEqual([
+      ['USDC', 'market_cap_usd'], ['USDC', 'price_usd'],
+    ]);
+    expect(usdc.observations.find((signal) => signal.metric === 'price_usd')).toMatchObject({ quality: 'COMPLETE', value: '1000100' });
+    expect(repeatedUsdc.status).toBe('cached');
+    expect(test.store.getMostRecentWithObservations(pair.cacheKey)?.signals.some((signal) => signal.asset === 'WETH')).toBe(true);
+    expect(test.store.getLatestSnapshotByCacheKey(usdc.cacheKey)?.asset).toBe('USDC');
+  });
+
+  it('rejects a non-USDC row from the exact-USDC request and never normalizes a substitute token', async () => {
+    const unexpected = {
+      data: [{ chain: 'base', token_address: BASE_ASSET_ADDRESSES.WETH, token_symbol: 'WETH', price_usd: 3_000 }],
+      pagination: { page: 1, per_page: 100, is_last_page: true },
+    };
+    const fake = transportQueue([response(unexpected)]);
+    const test = env(fake.transport);
+    const result = await test.manager.query(BASE_USDC_PRICE_QUERY);
+
+    expect(result.status).toBe('failed');
+    expect(result.observations.some((signal) => signal.quality === 'COMPLETE' && signal.value !== null)).toBe(false);
+    expect(result.failure?.code).toBe('INVALID_RESPONSE');
+    expect(fake.requests).toHaveLength(1);
+  });
+});
+describe('D2v managed Base USDC OHLCV price', () => {
+  function candle(intervalMs: number, close = 1.0002) {
+    return { interval_start: new Date(intervalMs).toISOString(), close, market_cap: { close: 1_000_000 } };
+  }
+  function body(query: ReturnType<typeof createBaseUsdcOhlcvPriceQuery>, close = 1.0002) {
+    return { chain: 'base', token_address: BASE_ASSET_ADDRESSES.USDC, timeframe: '1m',
+      data: [candle(Date.parse(query.date.to) - 2 * 60_000, close)] };
+  }
+
+  it('persists only exact-USDC recent candle provenance and reuses the same canonical cache without extending candle age', async () => {
+    const initial = new Date(timeMs);
+    const firstQuery = createBaseUsdcOhlcvPriceQuery(initial);
+    const secondQuery = createBaseUsdcOhlcvPriceQuery(new Date(timeMs + 30_000));
+    const thirdQuery = createBaseUsdcOhlcvPriceQuery(new Date(timeMs + 61_000));
+    const fake = transportQueue([response(body(firstQuery)), response(body(thirdQuery, 1.0003)), response(body(createBaseUsdcOhlcvPriceQuery(new Date(timeMs + 11 * 60_000))))]);
+    const test = env(fake.transport, { maxPages: 1, maxRetries: 0 });
+
+    const first = await test.manager.query(firstQuery);
+    timeMs += 30_000;
+    const cached = await test.manager.query(secondQuery);
+    timeMs = Date.parse(thirdQuery.date.to);
+    const refreshed = await test.manager.query(thirdQuery);
+
+    expect(first.cacheKey).toBe(cached.cacheKey);
+    expect(first.cacheKey).toBe(refreshed.cacheKey);
+    expect(first.cacheKey).not.toBe(BASE_USDC_OHLCV_PRICE_CACHE_KEY);
+    expect(first).toMatchObject({ status: 'fresh', operation: 'TOKEN_OHLCV', asset: 'USDC', timeframe: '1m', pageBound: 1, retryBound: 0 });
+    expect(first.observations).toHaveLength(1);
+    expect(first.observations[0]).toMatchObject({ endpoint: 'TOKEN_OHLCV', asset: 'USDC', metric: 'price_usd',
+      timeframe: '1m', observedAt: body(firstQuery).data[0]!.interval_start, value: '1000200', quality: 'COMPLETE' });
+    expect(cached.cacheHit).toBe(true);
+    expect(cached.observations[0]?.observedAt).toBe(first.observations[0]?.observedAt);
+    expect(refreshed.cacheHit).toBe(false);
+    expect(refreshed.observations[0]?.observedAt).toBe(body(thirdQuery).data[0]!.interval_start);
+    expect(fake.requests).toHaveLength(2);
+    expect(JSON.parse(fake.requests[0]!.body)).toEqual({ chain: 'base', token_address: BASE_ASSET_ADDRESSES.USDC,
+      timeframe: '1m', date: { from: firstQuery.date.from, to: firstQuery.date.to } });
+    expect(JSON.parse(fake.requests[1]!.body).date).toEqual(thirdQuery.date);
+    expect(test.ledger.getSnapshot()).toMatchObject({ allocatedCredits: 2, reportedChargeCount: 2, pendingAttemptCount: 0 });
+
+    const oldObservedAt = Date.parse(first.observations[0]!.observedAt);
+    expect(isWithinSignalFreshness('TOKEN_OHLCV', oldObservedAt, timeMs + 11 * 60_000)).toBe(false);
+    const fourthQuery = createBaseUsdcOhlcvPriceQuery(new Date(timeMs + 11 * 60_000));
+    const staleWouldBe = await test.store.getMostRecentWithObservations(first.cacheKey);
+    expect(staleWouldBe?.signals[0]?.observedAt).toBe(refreshed.observations[0]?.observedAt);
+    expect(Date.parse(fourthQuery.date.to)).toBeGreaterThan(timeMs);
+  });
+
+  it('keys historical USDC windows by exact dates in the separate query identity', async () => {
+    const from = new Date('2026-09-23T10:00:00.000Z');
+    const to = new Date(from.getTime() + 10 * 60_000);
+    const firstQuery = createHistoricalBaseUsdcOhlcvQuery(from, to);
+    const secondQuery = createHistoricalBaseUsdcOhlcvQuery(to, new Date(to.getTime() + 10 * 60_000));
+    const liveQuery = createBaseUsdcOhlcvPriceQuery(new Date(timeMs));
+    const fake = transportQueue([response(body(firstQuery)), response(body(secondQuery, 1.0003)), response(body(liveQuery))]);
+    const test = env(fake.transport, { maxPages: 1, maxRetries: 0 });
+
+    const first = await test.manager.query(firstQuery);
+    const second = await test.manager.query(secondQuery);
+    const live = await test.manager.query(liveQuery);
+    const replay = await test.manager.query(firstQuery);
+
+    expect(first.cacheKey).not.toBe(second.cacheKey);
+    expect(first.cacheKey).not.toBe(live.cacheKey);
+    expect(first.observations[0]?.observedAt).toBe(new Date(Date.parse(firstQuery.date.to) - 2 * 60_000).toISOString());
+    expect(second.observations[0]?.observedAt).toBe(new Date(Date.parse(secondQuery.date.to) - 2 * 60_000).toISOString());
+    expect(replay.cacheKey).toBe(first.cacheKey);
+    expect(replay.cacheHit).toBe(true);
+    expect(fake.requests).toHaveLength(3);
+    expect(fake.requests.map((request) => JSON.parse(request.body).date)).toEqual([firstQuery.date, secondQuery.date, liveQuery.date]);
+  });
+
+  it('persists an expired captured OHLCV snapshot without creating a cache entry', async () => {
+    const query = createBaseUsdcOhlcvPriceQuery(new Date(timeMs));
+    const fake = transportQueue([response(body(query))]);
+    const test = env(fake.transport, { maxPages: 1, maxRetries: 0 });
+    const result = await test.manager.query(query);
+    const original = test.store.getMostRecentWithObservations(result.cacheKey)!;
+    timeMs += 120_000;
+    const readCacheRows = () => {
+      const db = new DatabaseSync(test.storePath);
+      try { return db.prepare('SELECT cache_key, snapshot_id, cached_at_ms, expires_at_ms FROM cache_entries ORDER BY cache_key').all(); }
+      finally { db.close(); }
+    };
+    const cacheBefore = readCacheRows();
+    const historical = {
+      ...original,
+      snapshotId: cryptoRandomId(),
+      acquiredAt: new Date(Date.parse(original.acquiredAt) + 1).toISOString(),
+      signals: original.signals.map((signal) => ({ ...signal, signalId: cryptoRandomId() })),
+    };
+
+    expect(() => test.store.writeSnapshot(historical, { cache: false })).not.toThrow();
+    expect(test.store.getFreshCache(result.cacheKey, new Date(timeMs))).toBeNull();
+    expect(readCacheRows()).toEqual(cacheBefore);
+    expect(test.store.getLatestSnapshotByCacheKey(result.cacheKey)?.snapshotId).toBe(historical.snapshotId);
+    expect(fake.requests).toHaveLength(1);
+    expect(test.ledger.getSnapshot().allocatedCredits).toBe(1);
+  });
+
+  it('accepts sparse empty data as missing price rather than manufacturing a peg', async () => {
+    const query = createBaseUsdcOhlcvPriceQuery(new Date(timeMs));
+    const fake = transportQueue([response({ chain: 'base', token_address: BASE_ASSET_ADDRESSES.USDC, timeframe: '1m', data: [] })]);
+    const test = env(fake.transport, { maxPages: 1, maxRetries: 0 });
+    const result = await test.manager.query(query);
+    expect(result.operation).toBe('TOKEN_OHLCV');
+    expect(result.observations).toEqual([]);
+    expect(result.completeness).toBe('complete');
+    expect(result.attemptPageReferences).toHaveLength(1);
+    expect(fake.requests).toHaveLength(1);
+  });
+});
+describe('D2v observation store schema migration', () => {
+  it('migrates v1 operation constraints atomically while preserving snapshots, signals, cache, and identity', async () => {
+    const fake = transportQueue([response(screener)]);
+    const test = env(fake.transport);
+    const original = await test.manager.query(SCREEN_QUERY);
+    const originalSnapshot = test.store.getMostRecentWithObservations(original.cacheKey)!;
+    test.store.close();
+
+    const db = new DatabaseSync(test.storePath);
+    db.exec('PRAGMA foreign_keys = OFF');
+    db.exec('BEGIN IMMEDIATE');
+    const snapshotSql = String(db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'snapshots'").get()?.sql);
+    const observationSql = String(db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'observations'").get()?.sql);
+    const oldSnapshotSql = snapshotSql.replace('CREATE TABLE snapshots (', 'CREATE TABLE snapshots_v1 (')
+      .replace(", 'TOKEN_OHLCV'", '').replace("CHECK (((operation = 'TOKEN_OHLCV' AND asset = 'USDC' AND timeframe = '1m') OR (operation <> 'TOKEN_OHLCV' AND timeframe = '1h')))", "CHECK (timeframe = '1h')");
+    const oldObservationSql = observationSql.replace('CREATE TABLE observations (', 'CREATE TABLE observations_v1 (').replace(", 'TOKEN_OHLCV'", '');
+    expect(oldSnapshotSql).not.toBe(snapshotSql);
+    expect(oldObservationSql).not.toBe(observationSql);
+    db.exec(oldSnapshotSql);
+    db.exec('INSERT INTO snapshots_v1 SELECT * FROM snapshots');
+    db.exec(oldObservationSql);
+    db.exec('INSERT INTO observations_v1 SELECT * FROM observations');
+    db.exec('DROP TABLE observations');
+    db.exec('DROP TABLE snapshots');
+    db.exec('ALTER TABLE snapshots_v1 RENAME TO snapshots');
+    db.exec('ALTER TABLE observations_v1 RENAME TO observations');
+    db.exec('UPDATE store_meta SET schema_version = 1 WHERE singleton = 1');
+    db.exec('PRAGMA user_version = 1');
+    db.exec('COMMIT');
+    db.exec('PRAGMA foreign_keys = ON');
+    db.close();
+
+    const migrated = openNansenObservationStore({ databasePath: test.storePath, storeId: test.storeId, clock: test.clock });
+    stores.push(migrated);
+    const latest = migrated.getMostRecentWithObservations(original.cacheKey);
+    expect(latest?.snapshotId).toBe(originalSnapshot.snapshotId);
+    expect(latest?.signals).toEqual(originalSnapshot.signals);
+    expect(migrated.getFreshCache(original.cacheKey, new Date(timeMs))?.snapshotId).toBe(originalSnapshot.snapshotId);
+    expect(migrated.getLatestSnapshots('synthetic')).toHaveLength(1);
+  });
+});

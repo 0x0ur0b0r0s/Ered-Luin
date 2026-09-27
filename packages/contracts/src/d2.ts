@@ -11,13 +11,19 @@ const pageReferenceSchema = z.object({
 }).strict();
 
 export const d2ObservationBatchSchema = z.object({
-  snapshotId: observationId, operation: z.enum(['TOKEN_SCREENER', 'FLOW_INTELLIGENCE', 'SMART_MONEY_NETFLOW']),
+  snapshotId: observationId, operation: z.enum(['TOKEN_SCREENER', 'FLOW_INTELLIGENCE', 'SMART_MONEY_NETFLOW', 'TOKEN_OHLCV']),
+  timeframe: z.enum(['1h', '1m']),
   source: z.literal('nansen'), status: z.enum(['fresh', 'stale', 'incomplete', 'failed']),
   completeness: z.enum(['complete', 'incomplete', 'unknown']), fetchedAt: ISO_TIMESTAMP, acquiredAt: ISO_TIMESTAMP,
   expiresAt: ISO_TIMESTAMP, ageMs: z.number().int().nonnegative().safe(), pageBound: z.number().int().min(1).max(20),
   retryBound: z.number().int().min(0).max(2), pageReferences: z.array(pageReferenceSchema).max(60),
   observationIds: z.array(observationId).max(64), unavailableFields: z.array(z.string().min(1).max(128)).max(128),
-}).strict();
+}).strict().superRefine((batch, ctx) => {
+  if ((batch.operation === 'TOKEN_OHLCV' && (batch.timeframe !== '1m' || batch.pageBound !== 1 || batch.retryBound !== 0)) ||
+      (batch.operation !== 'TOKEN_OHLCV' && batch.timeframe !== '1h')) {
+    ctx.addIssue({ code: 'custom', path: ['timeframe'], message: 'Snapshot resolution and bounds must match its operation' });
+  }
+});
 export type D2ObservationBatch = z.infer<typeof d2ObservationBatchSchema>;
 
 export const d2EvidenceSchema = z.object({
@@ -38,9 +44,13 @@ export const d2EvidenceSchema = z.object({
   for (const batch of evidence.batches) {
     for (const id of batch.observationIds) {
       const signal = signals.get(id);
+      const lineageValid = signal?.endpoint === 'TOKEN_OHLCV'
+        ? batch.timeframe === '1m' && signal.timeframe === '1m' &&
+          Date.parse(signal.observedAt) + 60_000 <= Date.parse(signal.fetchedAt)
+        : batch.timeframe === '1h' && signal?.observedAt === batch.acquiredAt;
       if (!signal || signal.endpoint !== batch.operation || signal.provider !== batch.source ||
-          signal.fetchedAt !== batch.fetchedAt || signal.observedAt !== batch.acquiredAt) {
-        ctx.addIssue({ code: 'custom', path: ['batches'], message: 'Snapshot timestamps and operation must match linked observations' });
+          signal.fetchedAt !== batch.fetchedAt || !lineageValid) {
+        ctx.addIssue({ code: 'custom', path: ['batches'], message: 'Snapshot timestamps, resolution and operation must match linked observations' });
         break;
       }
     }
@@ -86,12 +96,12 @@ export const d2AnalysisPreviewSchema = z.object({
   generatedAt: ISO_TIMESTAMP, requestHash: z.string().regex(/^[0-9a-f]{64}$/u),
   proposalMatch: z.enum(['MATCHED', 'MISMATCHED', 'MISSING']), invocationEnabled: z.boolean(), credentialProviderConfigured: z.boolean(),
   canInvoke: z.boolean(), requestsMade: z.literal(0), missingPrerequisites: z.array(d2AnalysisBlockReason).max(16),
-  inputs: z.array(z.object({ snapshotId: observationId, operation: z.enum(['TOKEN_SCREENER', 'FLOW_INTELLIGENCE', 'SMART_MONEY_NETFLOW']),
+  inputs: z.array(z.object({ snapshotId: observationId, operation: z.enum(['TOKEN_SCREENER', 'FLOW_INTELLIGENCE', 'SMART_MONEY_NETFLOW', 'TOKEN_OHLCV']),
     source: z.enum(['nansen', 'synthetic']), status: z.enum(['fresh', 'cached', 'stale', 'incomplete', 'failed', 'disabled']),
     completeness: z.enum(['complete', 'incomplete', 'unknown']), fetchedAt: ISO_TIMESTAMP, ageMs: z.number().int().nonnegative().safe().nullable(),
     signalIds: z.array(observationId).max(64),
   }).strict()).max(3),
-  features: z.array(z.object({ endpoint: z.enum(['TOKEN_SCREENER', 'FLOW_INTELLIGENCE', 'SMART_MONEY_NETFLOW']),
+  features: z.array(z.object({ endpoint: z.enum(['TOKEN_SCREENER', 'FLOW_INTELLIGENCE', 'SMART_MONEY_NETFLOW', 'TOKEN_OHLCV']),
     asset: z.enum(['USDC', 'WETH']), metric: z.string().min(1).max(64), state: z.enum(['COMPLETE', 'ZERO', 'MISSING', 'PARTIAL', 'STALE', 'SYNTHETIC', 'CONTRADICTORY', 'INVALID']),
     quality: z.enum(['COMPLETE', 'PARTIAL', 'MISSING']), flags: z.array(z.enum(['MISSING', 'PARTIAL', 'STALE', 'SYNTHETIC', 'CONTRADICTORY', 'INVALID', 'DUPLICATE'])).max(7),
     signalIds: z.array(observationId).max(64),
@@ -205,11 +215,34 @@ export const d2ExecutionActionResponseSchema = z.object({
 }).strict();
 export type D2ExecutionActionResponse = z.infer<typeof d2ExecutionActionResponseSchema>;
 
+export const d2BrowserAllowancePreflightResponseSchema = z.object({
+  proposalId: z.uuid(), executionId: z.uuid(), sessionId: z.uuid(), walletAddress: z.string().regex(/^0x[0-9a-fA-F]{40}$/u),
+  chainId: z.literal(8453), tokenAddress: z.string().regex(/^0x[0-9a-fA-F]{40}$/u), spenderAddress: z.string().regex(/^0x[0-9a-fA-F]{40}$/u),
+  currentAllowanceAtomic: z.string().max(78).regex(/^(0|[1-9][0-9]*)$/u), requiredAmountAtomic: z.string().max(78).regex(/^[1-9][0-9]*$/u),
+  status: z.enum(['APPROVAL_REQUIRED', 'ALLOWANCE_SUFFICIENT']),
+}).strict();
+export type D2BrowserAllowancePreflightResponse = z.infer<typeof d2BrowserAllowancePreflightResponseSchema>;
+export const d2BrowserExecutionPrepareRequestSchema = z.object({ proposalId: z.uuid(), operationId: z.uuid(), sessionId: z.uuid() }).strict();
+export const d2BrowserExecutionIdentityRequestSchema = z.object({ proposalId: z.uuid(), operationId: z.uuid() }).strict();
+export const d2BrowserExecutionHashRequestSchema = z.object({ proposalId: z.uuid(), operationId: z.uuid(), transactionHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/u) }).strict();
+export const d2BrowserExecutionRejectRequestSchema = z.object({ proposalId: z.uuid(), operationId: z.uuid(), reason: z.enum(['USER_REJECTED', 'PRE_SEND_CONTEXT_CHANGED']) }).strict();
+export const d2BrowserExecutionActionResponseSchema = z.object({
+  proposalId: z.uuid(), executionId: z.uuid(), operationId: z.uuid(), sessionId: z.uuid(), kind: z.enum(['APPROVAL', 'SWAP']),
+  status: g3cWorkflowStatusSchema,
+  browserStage: z.enum(['READY', 'SUBMISSION_UNCERTAIN', 'SUBMITTED', 'RECONCILIATION_REQUIRED', 'CONFIRMED', 'REVERTED', 'REJECTED']),
+  walletAddress: z.string().regex(/^0x[0-9a-fA-F]{40}$/u), transaction: g3bUnsignedTransactionSchema,
+  transactionHash: z.string().regex(/^0x[0-9a-fA-F]{64}$/u).nullable(), submissionAttempts: z.number().int().nonnegative().safe(),
+  receiptOutcome: z.enum(['PENDING', 'CONFIRMED', 'REVERTED', 'REPLACED', 'CONFLICT']).nullable(),
+  receiptBlockNumber: z.string().max(78).regex(/^(0|[1-9][0-9]*)$/u).nullable(),
+  actualFeesUsdcMicros: z.string().max(78).regex(/^(0|[1-9][0-9]*)$/u).nullable(), replayed: z.boolean(),
+}).strict();
+export type D2BrowserExecutionActionResponse = z.infer<typeof d2BrowserExecutionActionResponseSchema>;
+
 
 export const d2RuntimeSchema = z.object({
   service: z.literal('ered-luin-api'), status: z.enum(['ok', 'degraded']), appMode: z.enum(['PRODUCTION_READ_ONLY', 'SYNTHETIC_REPLAY', 'LIVE_REVIEWED']),
   paidNansenCallsEnabled: z.literal(false), activeNansenCreditBudget: z.literal(0), liveExecutionEnabled: z.boolean(),
-  executionControls: z.object({ operatorAuthConfigured: z.boolean(), signingEnabled: z.boolean(), submissionEnabled: z.boolean(), reviewedMode: z.boolean() }).strict(),
+  executionControls: z.object({ operatorAuthConfigured: z.boolean(), signingEnabled: z.boolean(), submissionEnabled: z.boolean(), reviewedMode: z.boolean(), browserWalletEnabled: z.boolean() }).strict(),
   nansenObservationStore: z.enum(['configured', 'unconfigured']), productionEvaluation: z.enum(['configured', 'unconfigured']),
   baseRpc: z.enum(['disabled', 'configured_but_gated', 'read_only_enabled']), g3cStatusReader: z.enum(['configured', 'unconfigured']),
   rpcRunBudget: z.object({ maxRequests: z.number().int().nonnegative().safe(), usedRequests: z.number().int().nonnegative().safe(), recoveryReserve: z.number().int().nonnegative().safe() }).strict().nullable(),

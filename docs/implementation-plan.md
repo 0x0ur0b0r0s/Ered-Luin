@@ -44,3 +44,6 @@ Each gate has a bounded scope, explicit regression cases, and recorded validatio
 ## Out of scope
 
 Strategy profitability, automated capital deployment, additional chains, custom custody infrastructure, and production readiness beyond the accepted gates remain out of scope until separately planned and reviewed.
+## Future identity and webpage direction
+
+Use the canonical spelling **Ered Luin**. The user requested a future Blue Mountains theme and related feature names with clear functional subtitles. See [future identity brief](future-brand-and-webpage.md). This is a presentation backlog item; current demo and execution prerequisites remain the priority.
