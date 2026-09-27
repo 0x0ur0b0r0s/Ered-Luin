@@ -1,45 +1,72 @@
 # Ered Luin
 
-Ered Luin is a research and policy firewall for autonomous trading agents. It separates sourced observations and agent proposals from deterministic policy decisions, paper execution, and an auditable record.
+Ered Luin is a research and policy firewall for autonomous trading agents. It separates external market observations from agent proposals, deterministic policy evaluation, paper execution, and audit records.
 
-## Current status
+## Architecture
 
-As of September 27, 2026, the bounded historical Nansen runner completed 251 new unique successful requests. The conservative verified local total is 801 unique HTTP successes; this does not establish organizer qualification. The internal target is 1,050, and the public campaign page lists 1,000 calls. See the [deadline demo package](docs/deadline-demo-package.md) for the accounting basis and submission status.
+- **Evidence adapters** normalize Nansen Token OHLCV, Token Screener, and Smart Money Netflow responses into typed observations with provider attribution, quality, completeness, and observation timestamps.
+- **Query and accounting layer** applies explicit page and retry bounds, cache reuse, credit ledgers, allocation caps, and safe error codes before a provider request is dispatched.
+- **Observation stores** persist source batches and normalized signals independently from policy and execution state. Store identity and writer exclusion prevent cross-allocation contamination.
+- **Policy engine** evaluates trade intents against freshness, completeness, price, flow, gas, exposure, and notional constraints. It produces deterministic `ALLOW`, `RESIZE`, or `BLOCK` decisions with reasons and evidence identifiers.
+- **Paper execution and audit** record proposals, evaluations, reservations, simulations, and outcomes without creating a transaction or requiring a private key.
+- **Wallet boundary** is isolated behind explicit account, chain, allowance, transaction, and receipt checks. Browser submission is a separately gated capability.
 
-The earlier D2l collector is failed and has one unresolved reserved attempt. No collector is currently running. Historical evidence is stale and cannot authorize a current proposal or trade.
+## Runtime modes
 
-The local dashboard and API can be run in paper/read-only mode. The browser-wallet implementation is pending Astra review; browser submission, signing, live execution, and paid Nansen calls remain disabled. No live transaction, recording, public post, external deployment, or campaign entry is claimed.
+The checked-in defaults are deliberately conservative:
 
-## Safety defaults
+- `PRODUCTION_READ_ONLY` reads persisted observations and exposes policy output without dispatching paid Nansen calls.
+- `PAPER` initializes a simulated account and records policy/audit state without signing or broadcasting.
+- Reviewed browser execution is separately configured and remains disabled by default. Private keys stay in the user wallet.
 
-- Checked-in configuration keeps paid Nansen calls disabled with a zero default budget.
-- Execution defaults to paper mode; live execution, signing, and broadcast remain disabled.
-- The local demo uses synthetic observations and quotes. Synthetic fixtures are not market evidence.
-- Credentials, private keys, production databases, and operator run state do not belong in this repository.
+Credentials, private keys, production databases, and operator state are supplied through local configuration and are excluded from the repository.
 
-These defaults do not replace review of a separately provisioned local configuration.
+## Local paper demo
+
+The local dashboard presents the evidence-to-policy flow:
+
+1. persisted Nansen observations with source endpoint, value, quality, and observation time;
+2. a paper proposal and deterministic policy result;
+3. runtime controls showing whether signing, submission, browser wallet, and Base RPC are enabled;
+4. an auditable paper record with no transaction hash or fund movement.
+
+Run the dashboard with the [D1 local paper demo](docs/d1-local-demo.md). The [paper-demo recording](docs/demo-live-paper.mp4) is a screen capture of the same read-only flow. The [demo guide](docs/friday-demo.md) describes the presentation sequence.
 
 ## Setup
 
-Use Windows PowerShell 7, Node.js 24.20.0, and pnpm 11.25.0. Install Node.js and pnpm so both commands are available on PATH, then install from the lockfile:
+Use Windows PowerShell 7, Node.js 24.20.0, and pnpm 11.25.0. Install dependencies from the lockfile:
 
     .\tools\pnpm-node24.ps1 install --frozen-lockfile
 
-Build and check the workspace:
+Build and validate the workspace:
 
     .\tools\pnpm-node24.ps1 run build
     .\tools\pnpm-node24.ps1 run typecheck
     .\tools\pnpm-node24.ps1 run lint
     .\tools\pnpm-node24.ps1 run test
 
-The focused collector suites are also available:
+Focused suites are available for the bounded collection and ledger paths:
 
-    .\tools\pnpm-node24.ps1 run test:d2k
+    .\tools\pnpm-node24.ps1 run test:deadline
     .\tools\pnpm-node24.ps1 run test:d2l
+    .\tools\pnpm-node24.ps1 run test:d2u
+    .\tools\pnpm-node24.ps1 run test:d2v
 
-## Local demo
+## Repository layout
 
-Follow the [D1 local paper demo](docs/d1-local-demo.md). It runs the API and dashboard locally against synthetic observations and a paper store. The [demo guide](docs/friday-demo.md) describes what the demo shows and its limits. The [deadline demo package](docs/deadline-demo-package.md) includes a 45–60 second synthetic rehearsal plan and a separate, gated live sequence.
+- `apps/api` — Fastify API, policy evaluation, paper store, execution boundaries, and operator controls.
+- `apps/dashboard` — local evidence, policy, audit, and runtime-control UI.
+- `packages/contracts` — shared schemas and validation contracts.
+- `packages/nansen` — client core, adapters, query manager, credit ledger, cache, and observation store.
+- `tools/deadline` — bounded refresh and paper-demo utilities.
+- `tools/d2*` — gate-specific diagnostics, collection, and regression checks.
+- `docs` — implementation plan, build evidence, handoff, runbooks, and demo material.
+
+## Safety and operational boundary
+
+The repository demonstrates sourced evidence handling, deterministic controls, and paper execution. Paid provider dispatch, wallet signing, transaction submission, and live trading require an explicitly reviewed runtime configuration and are not enabled by the checked-in defaults.
+
+Synthetic fixtures are labeled as fixtures and are not market evidence. A successful mock or paper run does not constitute live-trading acceptance.
 
 ## Project documents
 
@@ -48,16 +75,7 @@ Follow the [D1 local paper demo](docs/d1-local-demo.md). It runs the API and das
 - [Current handoff](docs/current-handoff.md)
 - [D1 local demo setup](docs/d1-local-demo.md)
 - [Demo guide](docs/friday-demo.md)
-- [Deadline demonstration and submission package](docs/deadline-demo-package.md)
-
-## Current limitations
-
-- The D1 resize-clock repair still needs independent review and the local UI still needs its manual visual pass.
-- D2 production readiness is incomplete. Production provider behavior, deployment configuration, signer custody, and live operational controls have not been accepted as a whole.
-- The browser-wallet implementation has not been accepted for live use; its runtime flag is off.
-- The verified local request count is below the campaign page's 1,000-call figure, and organizer qualification is unconfirmed.
-- The full API suite previously had an intermittent timeout in a synthetic Alchemy configuration test; see the build-state for the exact recorded result.
-- The ledger uses Node's built-in SQLite API, which Node currently labels a release candidate.
-- This repository does not establish that synthetic results reflect market behavior or qualify for any external program.
-
-D2l research sampling and the local monitor are documented in [docs/d2l-research-monitoring.md](docs/d2l-research-monitoring.md).
+- [Paper-demo recording](docs/demo-live-paper.mp4)
+- [Desktop Rabby runbook](docs/desktop-rabby-runbook.md)
+- [Deadline demo package](docs/deadline-demo-package.md)
+- [D2l research monitoring](docs/d2l-research-monitoring.md)
