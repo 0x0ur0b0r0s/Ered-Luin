@@ -1,0 +1,9 @@
+{
+  "name": "ered-luin-public-examples",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "demo": "node examples/offline-demo.mjs"
+  }
+}

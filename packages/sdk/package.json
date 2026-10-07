@@ -1,0 +1,12 @@
+{
+  "name": "@ered-luin/sdk",
+  "version": "0.1.0",
+  "description": "Public EvidencePacket and IntelligencePacket type declarations for Ered Luin examples",
+  "type": "module",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts"
+    }
+  }
+}
